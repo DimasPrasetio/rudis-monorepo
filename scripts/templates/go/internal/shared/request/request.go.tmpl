@@ -1,0 +1,107 @@
+// Package request decodes what a handler reads from the request.
+package request
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"mime"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"__GO_MODULE__/internal/shared/apperror"
+)
+
+// MaxBodyBytes caps a JSON body. Uploads have their own handlers and limits.
+const MaxBodyBytes = 1 << 20
+
+// DecodeJSON reads one JSON object into dst. Only an application/json body is accepted: a
+// browser cannot send that cross-site without CORS, which is what keeps a cookie-authenticated
+// API safe from forged form or text/plain posts (415 otherwise). A malformed body, an unknown
+// field, or trailing data is the client's error (400); messages never echo Go internals.
+func DecodeJSON(w http.ResponseWriter, r *http.Request, dst any) error {
+	if mt, _, err := mime.ParseMediaType(r.Header.Get("Content-Type")); err != nil || mt != "application/json" {
+		return apperror.New(http.StatusUnsupportedMediaType, "Isi permintaan harus berformat JSON (Content-Type: application/json)")
+	}
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, MaxBodyBytes))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		var tooLarge *http.MaxBytesError
+		var typeErr *json.UnmarshalTypeError
+		switch {
+		case errors.As(err, &tooLarge):
+			return apperror.New(http.StatusRequestEntityTooLarge, "Isi permintaan terlalu besar")
+		case errors.Is(err, io.EOF):
+			return apperror.BadRequest("Isi permintaan kosong")
+		case errors.As(err, &typeErr) && typeErr.Field != "":
+			return apperror.BadRequest("Kolom " + typeErr.Field + " berisi tipe data yang salah")
+		case strings.HasPrefix(err.Error(), "json: unknown field "):
+			return apperror.BadRequest("Kolom tidak dikenal: " + strings.TrimPrefix(err.Error(), "json: unknown field "))
+		default:
+			return apperror.BadRequest("Isi permintaan bukan JSON yang valid")
+		}
+	}
+	if dec.More() {
+		return apperror.BadRequest("Isi permintaan harus berupa satu objek JSON")
+	}
+	return nil
+}
+
+// minTransferRate is the slowest link a large upload or download is given time for: 512 kbit/s,
+// a weak mobile connection.
+const minTransferRate = 64 << 10 // bytes per second
+
+// AllowTransfer gives the request time to move size bytes over a slow link — the server's read
+// and write timeouts are sized for ordinary API calls and would cut a large file off. Call it
+// first thing in an upload handler with the largest body it accepts, or in a download handler
+// with the file's size.
+func AllowTransfer(w http.ResponseWriter, size int64) {
+	d := time.Minute + time.Duration(size/minTransferRate)*time.Second
+	rc := http.NewResponseController(w)
+	_ = rc.SetReadDeadline(time.Now().Add(d))
+	_ = rc.SetWriteDeadline(time.Now().Add(d))
+}
+
+// PathInt64 parses the {name} path value as a positive integer ID.
+func PathInt64(r *http.Request, name string) (int64, error) {
+	id, err := strconv.ParseInt(r.PathValue(name), 10, 64)
+	if err != nil || id <= 0 {
+		return 0, apperror.BadRequest("Parameter " + name + " tidak valid")
+	}
+	return id, nil
+}
+
+type clientIPKey struct{}
+
+type requestIDKey struct{}
+
+// WithClientIP records the caller's address; the server's middleware sets it for every
+// request, honouring TRUSTED_PROXIES.
+func WithClientIP(ctx context.Context, ip string) context.Context {
+	return context.WithValue(ctx, clientIPKey{}, ip)
+}
+
+// ClientIP is the caller's address — the real client behind the host nginx, not the proxy —
+// for per-IP limits and logs.
+func ClientIP(r *http.Request) string { return ClientIPFrom(r.Context()) }
+
+// ClientIPFrom is ClientIP for code that has the request's context but not the request.
+func ClientIPFrom(ctx context.Context) string {
+	ip, _ := ctx.Value(clientIPKey{}).(string)
+	return ip
+}
+
+// WithRequestID records the request's X-Request-ID; the server's middleware sets it.
+func WithRequestID(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, requestIDKey{}, id)
+}
+
+// RequestID is the request's X-Request-ID, also on every log line of the request — what ties
+// an audit record or an error report to the logs.
+func RequestID(ctx context.Context) string {
+	id, _ := ctx.Value(requestIDKey{}).(string)
+	return id
+}

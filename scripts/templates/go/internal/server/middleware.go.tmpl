@@ -1,0 +1,175 @@
+package server
+
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"log/slog"
+	"net"
+	"net/http"
+	"net/netip"
+	"net/url"
+	"regexp"
+	"runtime/debug"
+	"strings"
+	"time"
+
+	"__GO_MODULE__/internal/shared/logger"
+	"__GO_MODULE__/internal/shared/request"
+	"__GO_MODULE__/internal/shared/response"
+)
+
+// chain wraps h so the first middleware listed runs first.
+func chain(h http.Handler, mw ...func(http.Handler) http.Handler) http.Handler {
+	for i := len(mw) - 1; i >= 0; i-- {
+		h = mw[i](h)
+	}
+	return h
+}
+
+var validRequestID = regexp.MustCompile(`^[A-Za-z0-9-]{1,64}$`)
+
+// requestID gives every request an X-Request-ID (kept from the client when it is sane) and
+// a logger carrying it, available to handlers through logger.From(r.Context()).
+func requestID(base *slog.Logger) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			id := r.Header.Get("X-Request-ID")
+			if !validRequestID.MatchString(id) {
+				b := make([]byte, 8)
+				_, _ = rand.Read(b)
+				id = hex.EncodeToString(b)
+			}
+			w.Header().Set("X-Request-ID", id)
+			ctx := request.WithRequestID(logger.WithContext(r.Context(), base.With("request_id", id)), id)
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
+}
+
+// clientIP records who is calling (request.ClientIP). The direct peer is the client unless it
+// is a trusted proxy; then X-Forwarded-For is read from the right, skipping trusted hops, so a
+// client cannot claim another address by sending the header itself.
+func clientIP(trusted []netip.Prefix) func(http.Handler) http.Handler {
+	isTrusted := func(a netip.Addr) bool {
+		for _, p := range trusted {
+			if p.Contains(a) {
+				return true
+			}
+		}
+		return false
+	}
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			host, _, err := net.SplitHostPort(r.RemoteAddr)
+			if err != nil {
+				host = r.RemoteAddr
+			}
+			ip := host
+			if peer, err := netip.ParseAddr(host); err == nil && isTrusted(peer.Unmap()) {
+				hops := strings.Split(r.Header.Get("X-Forwarded-For"), ",")
+				for i := len(hops) - 1; i >= 0; i-- {
+					a, err := netip.ParseAddr(strings.TrimSpace(hops[i]))
+					if err != nil {
+						break
+					}
+					ip = a.Unmap().String()
+					if !isTrusted(a.Unmap()) {
+						break
+					}
+				}
+			}
+			next.ServeHTTP(w, r.WithContext(request.WithClientIP(r.Context(), ip)))
+		})
+	}
+}
+
+// sameOrigin refuses a state-changing API call that a browser says came from another site
+// (Sec-Fetch-Site), or whose Origin names another host. Cookie sessions are sent with requests
+// from sibling subdomains too (SameSite treats them as one site); this closes that gap whatever
+// domains the app is deployed on. Clients that send neither header (curl, mobile apps using a
+// Bearer token) are not browsers and pass.
+func sameOrigin(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet, http.MethodHead, http.MethodOptions:
+			next.ServeHTTP(w, r)
+			return
+		}
+		if !strings.HasPrefix(r.URL.Path, "/api/") {
+			next.ServeHTTP(w, r)
+			return
+		}
+		site := r.Header.Get("Sec-Fetch-Site")
+		crossSite := site != "" && site != "same-origin" && site != "none"
+		if origin := r.Header.Get("Origin"); site == "" && origin != "" {
+			u, err := url.Parse(origin)
+			crossSite = err != nil || !strings.EqualFold(u.Host, r.Host)
+		}
+		if crossSite {
+			response.Fail(w, http.StatusForbidden, "Permintaan dari situs lain ditolak", nil)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// shuttingDown hands every request the channel closed when shutdown starts (request.AllowStream).
+func shuttingDown(ch <-chan struct{}) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			next.ServeHTTP(w, r.WithContext(request.WithShutdown(r.Context(), ch)))
+		})
+	}
+}
+
+// statusRecorder remembers the status a handler wrote.
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (s *statusRecorder) WriteHeader(code int) {
+	s.status = code
+	s.ResponseWriter.WriteHeader(code)
+}
+
+// Unwrap lets http.ResponseController reach the underlying writer.
+func (s *statusRecorder) Unwrap() http.ResponseWriter { return s.ResponseWriter }
+
+// logRequests logs one line per API call. Static files and the readiness probe — polled
+// every 30s by the HEALTHCHECK — are left out to keep the log readable.
+func logRequests(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/api/") {
+			next.ServeHTTP(w, r)
+			return
+		}
+		start := time.Now()
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(rec, r)
+		logger.From(r.Context()).Info("request",
+			"method", r.Method,
+			"path", r.URL.Path,
+			"ip", request.ClientIP(r),
+			"status", rec.status,
+			"duration_ms", time.Since(start).Milliseconds(),
+		)
+	})
+}
+
+// recoverPanics turns a panicking handler into a 500 envelope and logs the stack, so one
+// bad request never takes the process down.
+func recoverPanics(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if v := recover(); v != nil {
+				if v == http.ErrAbortHandler {
+					panic(v)
+				}
+				logger.From(r.Context()).Error("panic", "value", v, "stack", string(debug.Stack()))
+				response.Fail(w, http.StatusInternalServerError, "Terjadi kesalahan pada server", nil)
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
+}

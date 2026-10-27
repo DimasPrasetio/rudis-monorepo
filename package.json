@@ -1,0 +1,8 @@
+{
+  "name": "rudis-monorepo-skill-repo",
+  "private": true,
+  "description": "Dev tooling for the rudis-monorepo skill repo itself (not part of the shipped .skill payload).",
+  "scripts": {
+    "verify": "node scripts/check-drift.mjs && node scripts/smoke-test.mjs && node scripts/package.mjs"
+  }
+}

@@ -1,0 +1,64 @@
+package server
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"net/netip"
+	"testing"
+
+	"__GO_MODULE__/internal/shared/request"
+)
+
+func TestSameOriginRefusesCrossSiteWrites(t *testing.T) {
+	ok := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) })
+	cases := []struct {
+		name, method, path, site, origin string
+		want                             int
+	}{
+		{"same-origin post", "POST", "/api/v1/x", "same-origin", "", http.StatusNoContent},
+		{"sibling subdomain post", "POST", "/api/v1/x", "same-site", "", http.StatusForbidden},
+		{"other site delete", "DELETE", "/api/v1/x", "cross-site", "", http.StatusForbidden},
+		{"cross-site read is fine", "GET", "/api/v1/x", "cross-site", "", http.StatusNoContent},
+		{"non-browser client", "POST", "/api/v1/x", "", "", http.StatusNoContent},
+		{"old browser, foreign origin", "POST", "/api/v1/x", "", "https://evil.example", http.StatusForbidden},
+		{"old browser, same origin", "POST", "/api/v1/x", "", "http://app.test", http.StatusNoContent},
+		{"not the API", "POST", "/upload-form", "cross-site", "", http.StatusNoContent},
+	}
+	for _, c := range cases {
+		r := httptest.NewRequest(c.method, "http://app.test"+c.path, nil)
+		if c.site != "" {
+			r.Header.Set("Sec-Fetch-Site", c.site)
+		}
+		if c.origin != "" {
+			r.Header.Set("Origin", c.origin)
+		}
+		w := httptest.NewRecorder()
+		sameOrigin(ok).ServeHTTP(w, r)
+		if w.Code != c.want {
+			t.Errorf("%s: got %d, want %d", c.name, w.Code, c.want)
+		}
+	}
+}
+
+func TestClientIPTrustsOnlyConfiguredProxies(t *testing.T) {
+	trusted := []netip.Prefix{netip.MustParsePrefix("172.16.0.0/12")}
+	cases := []struct{ name, remote, xff, want string }{
+		{"direct client", "203.0.113.7:5000", "", "203.0.113.7"},
+		{"direct client cannot spoof", "203.0.113.7:5000", "10.9.9.9", "203.0.113.7"},
+		{"behind nginx", "172.18.0.1:5000", "198.51.100.4", "198.51.100.4"},
+		{"spoofed hop before nginx", "172.18.0.1:5000", "10.9.9.9, 198.51.100.4", "198.51.100.4"},
+	}
+	for _, c := range cases {
+		var got string
+		h := clientIP(trusted)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { got = request.ClientIP(r) }))
+		r := httptest.NewRequest("GET", "/", nil)
+		r.RemoteAddr = c.remote
+		if c.xff != "" {
+			r.Header.Set("X-Forwarded-For", c.xff)
+		}
+		h.ServeHTTP(httptest.NewRecorder(), r)
+		if got != c.want {
+			t.Errorf("%s: got %q, want %q", c.name, got, c.want)
+		}
+	}
+}

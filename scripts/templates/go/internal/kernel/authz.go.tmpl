@@ -1,0 +1,171 @@
+package kernel
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"sort"
+	"sync"
+
+	"__GO_MODULE__/internal/shared/response"
+)
+
+// Permission is one thing a module lets an admin grant, named "<module>.<action>"
+// (e.g. "users.manage"). Permissions come from code — modules declare them; who holds them
+// is data, kept by the authorization provider.
+type Permission struct {
+	Name        string `json:"name"`
+	Module      string `json:"module"`
+	Description string `json:"description"`
+}
+
+// Authorizer decides whether the signed-in user may do something.
+type Authorizer interface {
+	Can(ctx context.Context, permission string) bool
+	// Covers reports whether the signed-in user holds every permission the target user holds.
+	// A module managing people checks it before acting on someone else's account, so an
+	// operator can never reset an administrator's password or deactivate them.
+	Covers(ctx context.Context, target int64) bool
+}
+
+// Units is how far a permission reaches inside the active company: every branch, or these.
+type Units struct {
+	AllBranches bool
+	BranchIDs   []int64
+}
+
+// Includes reports whether branch is within reach (branch 0, "the company itself", only with
+// AllBranches).
+func (u Units) Includes(branch int64) bool {
+	if u.AllBranches {
+		return true
+	}
+	for _, b := range u.BranchIDs {
+		if b == branch {
+			return true
+		}
+	}
+	return false
+}
+
+// ScopedAuthorizer is what an authorization provider that grants roles per branch adds: which
+// branches of the active company a permission reaches — for list filters. Optional: a provider
+// without it grants a permission across the whole company.
+type ScopedAuthorizer interface {
+	Units(ctx context.Context, permission string) (Units, error)
+}
+
+// AuthzSlot is the authorization every module receives in Deps.Authz. Like Auth, it is a
+// kernel port rather than a per-module one: nearly every module needs it.
+//
+// Without a provider the policy is "signed in = allowed", so a module works on its own while
+// it is developed; a production server refuses to start that way (Check). Once the composition
+// root calls Provide (the rbac module), its decisions apply everywhere.
+type AuthzSlot struct {
+	auth  *AuthSlot
+	mu    sync.RWMutex
+	p     Authorizer
+	perms map[string]Permission
+}
+
+// NewAuthzSlot returns the slot; it identifies users through auth.
+func NewAuthzSlot(auth *AuthSlot) *AuthzSlot {
+	return &AuthzSlot{auth: auth, perms: map[string]Permission{}}
+}
+
+// Declare registers the permissions a module guards with. Call it in the module's New. Two
+// modules declaring the same name would silently share one grant, so that stops the API.
+func (s *AuthzSlot) Declare(perms ...Permission) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, p := range perms {
+		if prev, ok := s.perms[p.Name]; ok && prev.Module != p.Module {
+			panic(fmt.Sprintf("authz: permission %q declared by both %q and %q — name it <module>.<action>", p.Name, prev.Module, p.Module))
+		}
+		s.perms[p.Name] = p
+	}
+}
+
+// Check reports permissions declared with nobody to decide them. In production that would
+// mean "signed in = allowed" for every guarded route, so the server refuses to start.
+func (s *AuthzSlot) Check() error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.p == nil && len(s.perms) > 0 {
+		return fmt.Errorf("%d permission(s) declared but no authorization provider is set — install an authorization module (the library's rbac) and Provide it in registry.go", len(s.perms))
+	}
+	return nil
+}
+
+// Permissions returns every declared permission, sorted by name — the catalog an
+// authorization provider offers admins.
+func (s *AuthzSlot) Permissions() []Permission {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]Permission, 0, len(s.perms))
+	for _, p := range s.perms {
+		out = append(out, p)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+// Provide sets the authorization provider. Called once, from internal/modules/registry.go.
+func (s *AuthzSlot) Provide(p Authorizer) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.p = p
+}
+
+func (s *AuthzSlot) provider() Authorizer {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.p
+}
+
+// Can reports whether the signed-in user holds permission.
+func (s *AuthzSlot) Can(ctx context.Context, permission string) bool {
+	if p := s.provider(); p != nil {
+		return p.Can(ctx, permission)
+	}
+	_, signedIn := s.auth.UserID(ctx)
+	return signedIn
+}
+
+// Covers reports whether the signed-in user may act on target's account: target holds no
+// permission the signed-in user lacks. Without a provider every signed-in user is equal.
+func (s *AuthzSlot) Covers(ctx context.Context, target int64) bool {
+	if p := s.provider(); p != nil {
+		return p.Covers(ctx, target)
+	}
+	_, signedIn := s.auth.UserID(ctx)
+	return signedIn
+}
+
+// Units is how far permission reaches for the signed-in user in the active company: the
+// provider's answer when it grants per branch, else every branch when Can, none otherwise.
+func (s *AuthzSlot) Units(ctx context.Context, permission string) (Units, error) {
+	if sp, ok := s.provider().(ScopedAuthorizer); ok {
+		return sp.Units(ctx, permission)
+	}
+	return Units{AllBranches: s.Can(ctx, permission)}, nil
+}
+
+// Require wraps h so it runs only for a signed-in user holding permission: 401 without a
+// session (through d.Auth), 403 without the permission. Using a permission nobody declared
+// is a programming error, caught when the routes are mounted.
+func (s *AuthzSlot) Require(permission string, h http.Handler) http.Handler {
+	s.mu.RLock()
+	_, declared := s.perms[permission]
+	s.mu.RUnlock()
+	if !declared {
+		panic(fmt.Sprintf("authz: route guarded by %q, which no module declared — call d.Authz.Declare in New", permission))
+	}
+	return s.auth.Require(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !s.Can(r.Context(), permission) {
+			response.Fail(w, http.StatusForbidden, "Anda tidak memiliki izin untuk melakukan ini", nil)
+			return
+		}
+		h.ServeHTTP(w, r)
+	}))
+}

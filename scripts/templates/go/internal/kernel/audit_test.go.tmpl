@@ -1,0 +1,47 @@
+package kernel
+
+import (
+	"context"
+	"net/http"
+	"testing"
+
+	"__GO_MODULE__/internal/shared/request"
+)
+
+type memSink struct{ got []AuditRecord }
+
+func (m *memSink) Write(_ context.Context, r AuditRecord) error {
+	m.got = append(m.got, r)
+	return nil
+}
+
+type fixedAuth struct{ id int64 }
+
+func (f fixedAuth) Require(h http.Handler) http.Handler  { return h }
+func (f fixedAuth) UserID(context.Context) (int64, bool) { return f.id, f.id != 0 }
+
+func TestAuditFillsWhoAndWhereFromTheRequest(t *testing.T) {
+	auth := &AuthSlot{}
+	auth.Provide(fixedAuth{id: 7})
+	s := NewAuditSlot(auth, nil, quietLog())
+	sink := &memSink{}
+	s.Provide(sink)
+	ctx := request.WithRequestID(request.WithClientIP(context.Background(), "203.0.113.7"), "req-1")
+	s.Record(ctx, AuditEntry{Module: "users", Action: "user.updated", Target: "user:12"})
+	s.Record(ctx, AuditEntry{Module: "auth", Action: "auth.signed_in", Actor: 12})
+	if len(sink.got) != 2 {
+		t.Fatalf("got %d records", len(sink.got))
+	}
+	r := sink.got[0]
+	if r.ActorID != 7 || r.IP != "203.0.113.7" || r.RequestID != "req-1" || r.At.IsZero() {
+		t.Fatalf("record = %+v", r)
+	}
+	if sink.got[1].ActorID != 12 {
+		t.Fatalf("an explicit actor must win, got %d", sink.got[1].ActorID)
+	}
+}
+
+func TestAuditWithoutAProviderOnlyLogs(t *testing.T) {
+	s := NewAuditSlot(&AuthSlot{}, nil, quietLog())
+	s.Record(context.Background(), AuditEntry{Module: "x", Action: "y.z"}) // must not panic
+}

@@ -1,0 +1,43 @@
+package kerneltest
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"__GO_MODULE__/internal/kernel"
+)
+
+func TestKitRunsTasksAndEventsAndRecordsAudit(t *testing.T) {
+	k := Deps(t)
+	d := k.Deps
+	delivered := 0
+	d.Events.On("orders.order.placed", "stock.reserve", func(ctx context.Context, ev kernel.Event) error {
+		delivered++
+		d.Audit.Record(ctx, kernel.AuditEntry{Module: "stock", Action: "stock.reserved", Summary: "Reserved"})
+		return nil
+	})
+	ctx := In(context.Background(), 2, 5)
+	if err := d.Tx.Do(ctx, func(ctx context.Context) error {
+		return d.Events.Publish(ctx, "orders.order.placed", 1, map[string]int{"id": 9})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(k.Enqueued()) != 1 || len(k.Published()) != 1 {
+		t.Fatalf("enqueued %d, published %d", len(k.Enqueued()), len(k.Published()))
+	}
+	if n := k.RunTasks(); n != 1 || delivered != 1 {
+		t.Fatalf("ran %d, delivered %d", n, delivered)
+	}
+	if recs := k.Audit.Records(); len(recs) != 1 || recs[0].Kind != kernel.AuditChange {
+		t.Fatalf("audit = %+v", recs)
+	}
+	before := kernel.Today(ctx, d.Clock)
+	k.Clock.Advance(24 * time.Hour)
+	if after := kernel.Today(ctx, d.Clock); after == before {
+		t.Fatal("the clock did not move")
+	}
+	if s := kernel.ScopeFrom(ctx); s.CompanyID != 2 || s.BranchID != 5 {
+		t.Fatalf("scope %+v", s)
+	}
+}

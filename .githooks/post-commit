@@ -1,0 +1,5 @@
+#!/bin/sh
+# Tags a kernel release (rudis-monorepo/kernel/v<N>.<R>) when a commit changes what a
+# scaffolded project or the references contain — what the module library pins.
+# Push with: git push --follow-tags
+exec node scripts/kernel-tag.mjs

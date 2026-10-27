@@ -1,0 +1,9 @@
+[Unit]
+Description=rudis: back up every app database (rotated)
+After=mysql.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/rudis/backup.sh
+Nice=10
+IOSchedulingClass=idle

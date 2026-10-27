@@ -1,0 +1,654 @@
+package kernel
+
+import (
+	"context"
+	"crypto/rand"
+	"database/sql"
+	"encoding/hex"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/go-sql-driver/mysql"
+
+	"__GO_MODULE__/internal/database"
+)
+
+// mysqlDB gives a test its own database with the kernel's tables, from KERNEL_TEST_DSN (a server
+// DSN without a database, e.g. "root:@tcp(localhost:3306)/"); skipped without it. The library's
+// testbed and the skill's smoke test set it.
+func mysqlDB(t *testing.T, params ...string) *sql.DB {
+	t.Helper()
+	dsn := os.Getenv("KERNEL_TEST_DSN")
+	if dsn == "" {
+		t.Skip("KERNEL_TEST_DSN not set")
+	}
+	cfg, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := make([]byte, 4)
+	_, _ = rand.Read(b)
+	name := "kernel_test_" + hex.EncodeToString(b)
+	admin, err := sql.Open("mysql", cfg.FormatDSN())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := admin.Exec("CREATE DATABASE " + name); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = admin.Exec("DROP DATABASE " + name)
+		admin.Close()
+	})
+	cfg.DBName = name
+	cfg.MultiStatements = true
+	for _, p := range params {
+		k, v, _ := strings.Cut(p, "=")
+		if cfg.Params == nil {
+			cfg.Params = map[string]string{}
+		}
+		cfg.Params[k] = v
+	}
+	migrations, _ := filepath.Glob("../../migrations/*kernel_6.up.sql")
+	if len(migrations) != 1 {
+		t.Fatalf("kernel migration not found: %v", migrations)
+	}
+	schema, err := os.ReadFile(migrations[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	setup, err := sql.Open("mysql", cfg.FormatDSN())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer setup.Close()
+	if _, err := setup.Exec(strings.TrimRight(string(schema), "; \n") + ";CREATE TABLE things (id BIGINT PRIMARY KEY, n INT NOT NULL DEFAULT 0);CREATE TABLE notes (id BIGINT AUTO_INCREMENT PRIMARY KEY, body VARCHAR(100) NOT NULL);INSERT INTO things (id) VALUES (1), (2)"); err != nil {
+		t.Fatal(err)
+	}
+	cfg.MultiStatements = false
+	db, err := database.Open(cfg.FormatDSN())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	return db
+}
+
+func count(t *testing.T, db *sql.DB, q string, args ...any) int {
+	t.Helper()
+	var n int
+	if err := db.QueryRow(q, args...).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+func TestMySQLTxCommitsRollsBackAndJoins(t *testing.T) {
+	db := mysqlDB(t)
+	tx := NewTxSlot(db, quietLog())
+	ctx := context.Background()
+	hooks := 0
+	err := tx.Do(ctx, func(ctx context.Context) error {
+		tx.AfterCommit(ctx, func(context.Context) { hooks++ })
+		if _, err := tx.Conn(ctx).ExecContext(ctx, "INSERT INTO notes (body) VALUES ('kept')"); err != nil {
+			return err
+		}
+		return tx.Do(ctx, func(ctx context.Context) error { // a port joining the transaction
+			_, err := tx.Conn(ctx).ExecContext(ctx, "UPDATE things SET n = n + 1 WHERE id = 1")
+			return err
+		})
+	})
+	if err != nil || hooks != 1 || count(t, db, "SELECT COUNT(*) FROM notes") != 1 || count(t, db, "SELECT n FROM things WHERE id = 1") != 1 {
+		t.Fatalf("commit: err=%v hooks=%d", err, hooks)
+	}
+	boom := errors.New("boom")
+	err = tx.Do(ctx, func(ctx context.Context) error {
+		tx.AfterCommit(ctx, func(context.Context) { hooks++ })
+		_, _ = tx.Conn(ctx).ExecContext(ctx, "INSERT INTO notes (body) VALUES ('gone')")
+		return tx.Do(ctx, func(context.Context) error { return boom }) // the port fails: all of it rolls back
+	})
+	if !errors.Is(err, boom) || hooks != 1 || count(t, db, "SELECT COUNT(*) FROM notes") != 1 {
+		t.Fatalf("rollback: err=%v hooks=%d notes=%d", err, hooks, count(t, db, "SELECT COUNT(*) FROM notes"))
+	}
+}
+
+func TestMySQLTxRetriesADeadlockFromTheStart(t *testing.T) {
+	db := mysqlDB(t)
+	tx := NewTxSlot(db, quietLog())
+	var attempts atomic.Int32
+	var ready sync.WaitGroup
+	ready.Add(2)
+	run := func(first, second int) error {
+		once := sync.Once{}
+		return tx.Do(context.Background(), func(ctx context.Context) error {
+			attempts.Add(1)
+			c := tx.Conn(ctx)
+			if _, err := c.ExecContext(ctx, "INSERT INTO notes (body) VALUES ('try')"); err != nil {
+				return err
+			}
+			if _, err := c.ExecContext(ctx, "UPDATE things SET n = n + 1 WHERE id = ?", first); err != nil {
+				return err
+			}
+			once.Do(func() { ready.Done(); ready.Wait() }) // both hold their first lock
+			_, err := c.ExecContext(ctx, "UPDATE things SET n = n + 1 WHERE id = ?", second)
+			return err
+		})
+	}
+	errs := make(chan error, 2)
+	go func() { errs <- run(1, 2) }()
+	go func() { errs <- run(2, 1) }()
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatalf("a transaction failed after retries: %v", err)
+		}
+	}
+	if attempts.Load() < 3 {
+		t.Fatalf("no deadlock happened (attempts %d) — the test proved nothing", attempts.Load())
+	}
+	// Exactly one committed run each: the retried one's first insert was rolled back with it.
+	if n := count(t, db, "SELECT COUNT(*) FROM notes"); n != 2 {
+		t.Fatalf("notes = %d, want 2", n)
+	}
+	if n := count(t, db, "SELECT SUM(n) FROM things"); n != 4 {
+		t.Fatalf("updates = %d, want 4", n)
+	}
+}
+
+func TestMySQLTxRollsBackAllOfItAfterALockWaitTimeout(t *testing.T) {
+	db := mysqlDB(t, "innodb_lock_wait_timeout=1")
+	tx := NewTxSlot(db, quietLog())
+	holder, err := db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := holder.Exec("UPDATE things SET n = n + 100 WHERE id = 1"); err != nil {
+		t.Fatal(err)
+	}
+	retried := make(chan struct{})
+	go func() { // release once the first attempt has timed out and the retry began
+		select {
+		case <-retried:
+		case <-time.After(20 * time.Second):
+		}
+		_ = holder.Rollback()
+	}()
+	var attempts atomic.Int32
+	err = tx.Do(context.Background(), func(ctx context.Context) error {
+		if attempts.Add(1) == 2 {
+			close(retried)
+		}
+		c := tx.Conn(ctx)
+		if _, err := c.ExecContext(ctx, "INSERT INTO notes (body) VALUES ('once')"); err != nil {
+			return err
+		}
+		_, err := c.ExecContext(ctx, "UPDATE things SET n = n + 1 WHERE id = 1")
+		return err
+	})
+	if err != nil || attempts.Load() < 2 {
+		t.Fatalf("err=%v attempts=%d", err, attempts.Load())
+	}
+	// MySQL rolled back only the timed-out statement; the kernel rolled back the insert too.
+	if n := count(t, db, "SELECT COUNT(*) FROM notes"); n != 1 {
+		t.Fatalf("notes = %d, want exactly 1", n)
+	}
+}
+
+func mysqlKernel(t *testing.T) (*sql.DB, *TxSlot, *TasksSlot, *EventsSlot, *JobsSlot) {
+	t.Helper()
+	db := mysqlDB(t)
+	clock := NewClock(time.UTC)
+	tx := NewTxSlot(db, quietLog())
+	jobs := NewJobsSlot(db, "test", clock, quietLog())
+	tasks := NewTasksSlot(db, tx, NewAuthSlot(nil), jobs, clock, quietLog())
+	return db, tx, tasks, NewEventsSlot(tasks, tx, clock), jobs
+}
+
+func waitFor(t *testing.T, what string, ok func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for !ok() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func stop(t *testing.T, tasks *TasksSlot) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := tasks.Stop(ctx); err != nil {
+		t.Error(err)
+	}
+}
+
+func TestMySQLTasksExistOnlyIfTheirTransactionCommits(t *testing.T) {
+	db, tx, tasks, _, _ := mysqlKernel(t)
+	var runs atomic.Int32
+	tasks.Register("test.note", func(ctx context.Context, task Task) error {
+		runs.Add(1)
+		_, err := tx.Conn(ctx).ExecContext(ctx, "INSERT INTO notes (body) VALUES ('from task')")
+		return err
+	}, TaskKind{})
+	ctx := context.Background()
+	_ = tx.Do(ctx, func(ctx context.Context) error {
+		_ = tasks.Enqueue(ctx, "test.note", nil)
+		return errors.New("rolled back")
+	})
+	if n := count(t, db, "SELECT COUNT(*) FROM kernel_tasks"); n != 0 {
+		t.Fatalf("a task of a rolled-back transaction exists (%d)", n)
+	}
+	if err := tx.Do(ctx, func(ctx context.Context) error { return tasks.Enqueue(ctx, "test.note", nil, Dedupe("k")) }); err != nil {
+		t.Fatal(err)
+	}
+	_ = tasks.Enqueue(ctx, "test.note", nil, Dedupe("k")) // a duplicate: no-op while the first waits
+	tasks.Start(ctx)
+	defer stop(t, tasks)
+	waitFor(t, "the task", func() bool { return count(t, db, "SELECT COUNT(*) FROM kernel_tasks WHERE status = 'done'") == 1 })
+	if runs.Load() != 1 || count(t, db, "SELECT COUNT(*) FROM notes") != 1 || count(t, db, "SELECT COUNT(*) FROM kernel_tasks") != 1 {
+		t.Fatalf("runs=%d notes=%d tasks=%d", runs.Load(), count(t, db, "SELECT COUNT(*) FROM notes"), count(t, db, "SELECT COUNT(*) FROM kernel_tasks"))
+	}
+}
+
+func TestMySQLTaskFailuresRetryThenFail(t *testing.T) {
+	db, tx, tasks, _, _ := mysqlKernel(t)
+	tasks.Register("test.flaky", func(ctx context.Context, task Task) error {
+		_, _ = tx.Conn(ctx).ExecContext(ctx, "INSERT INTO notes (body) VALUES ('undone')")
+		return errors.New("not yet")
+	}, TaskKind{MaxAttempts: 2})
+	ctx := context.Background()
+	_ = tasks.Enqueue(ctx, "test.flaky", nil)
+	tasks.Start(ctx)
+	defer stop(t, tasks)
+	waitFor(t, "first failure", func() bool {
+		return count(t, db, "SELECT COUNT(*) FROM kernel_tasks WHERE status = 'ready' AND attempts = 1 AND last_error = 'not yet'") == 1
+	})
+	if count(t, db, "SELECT COUNT(*) FROM kernel_tasks WHERE run_at > UTC_TIMESTAMP(6)") != 1 {
+		t.Fatal("the retry is not scheduled later")
+	}
+	_, _ = db.Exec("UPDATE kernel_tasks SET run_at = UTC_TIMESTAMP(6)")
+	tasks.signal(LaneShort)
+	waitFor(t, "failed", func() bool { return count(t, db, "SELECT COUNT(*) FROM kernel_tasks WHERE status = 'failed'") == 1 })
+	if n := count(t, db, "SELECT COUNT(*) FROM notes"); n != 0 {
+		t.Fatalf("a failed attempt's writes survived (%d)", n)
+	}
+	list, total, err := tasks.List(ctx, TaskFilter{Status: "failed"})
+	if err != nil || total != 1 || list[0].Kind != "test.flaky" {
+		t.Fatalf("list: %v %d %v", list, total, err)
+	}
+	if err := tasks.Discard(ctx, list[0].ID); err != nil || count(t, db, "SELECT COUNT(*) FROM kernel_tasks") != 0 {
+		t.Fatalf("discard: %v", err)
+	}
+}
+
+func TestMySQLAbandonedTaskIsReclaimedAndRunsOnce(t *testing.T) {
+	db, tx, tasks, _, _ := mysqlKernel(t)
+	var runs atomic.Int32
+	tasks.Register("test.once", func(ctx context.Context, task Task) error {
+		runs.Add(1)
+		_, err := tx.Conn(ctx).ExecContext(ctx, "INSERT INTO notes (body) VALUES ('effect')")
+		return err
+	}, TaskKind{})
+	ctx := context.Background()
+	_ = tasks.Enqueue(ctx, "test.once", nil)
+	// A worker that died mid-task: running, lease expired.
+	_, _ = db.Exec("UPDATE kernel_tasks SET status = 'running', lease_token = 'dead', locked_until = UTC_TIMESTAMP(6) - INTERVAL 1 SECOND, attempts = 1")
+	if err := tasks.reclaim(ctx); err != nil {
+		t.Fatal(err)
+	}
+	tasks.Start(ctx)
+	defer stop(t, tasks)
+	waitFor(t, "done", func() bool { return count(t, db, "SELECT COUNT(*) FROM kernel_tasks WHERE status = 'done'") == 1 })
+	if runs.Load() != 1 || count(t, db, "SELECT COUNT(*) FROM notes") != 1 {
+		t.Fatalf("runs=%d notes=%d", runs.Load(), count(t, db, "SELECT COUNT(*) FROM notes"))
+	}
+}
+
+func TestMySQLLostLeaseUndoesTheHandler(t *testing.T) {
+	db, tx, tasks, _, _ := mysqlKernel(t)
+	tasks.Register("test.slow", func(ctx context.Context, task Task) error {
+		_, _ = tx.Conn(ctx).ExecContext(ctx, "INSERT INTO notes (body) VALUES ('lost')")
+		_, err := db.ExecContext(ctx, "UPDATE kernel_tasks SET lease_token = 'stolen' WHERE id = ?", task.ID) // another worker took over
+		return err
+	}, TaskKind{})
+	ctx := context.Background()
+	_ = tasks.Enqueue(ctx, "test.slow", nil)
+	tasks.Start(ctx)
+	defer stop(t, tasks)
+	waitFor(t, "the lease to be stolen", func() bool {
+		return count(t, db, "SELECT COUNT(*) FROM kernel_tasks WHERE lease_token = 'stolen'") == 1
+	})
+	time.Sleep(200 * time.Millisecond)
+	if n := count(t, db, "SELECT COUNT(*) FROM notes"); n != 0 {
+		t.Fatalf("the handler's writes committed without the lease (%d)", n)
+	}
+}
+
+func TestMySQLEventsAreDurableAndIsolated(t *testing.T) {
+	db, tx, tasks, events, _ := mysqlKernel(t)
+	var flaky, steady atomic.Int32
+	events.On("sales.invoice.posted", "ledger.post", func(ctx context.Context, ev Event) error {
+		if flaky.Add(1) < 3 {
+			return errors.New("ledger busy")
+		}
+		_, err := tx.Conn(ctx).ExecContext(ctx, "INSERT INTO notes (body) VALUES ('ledger')")
+		return err
+	})
+	events.On("sales.invoice.posted", "notify.tell", func(ctx context.Context, ev Event) error {
+		steady.Add(1)
+		return nil
+	})
+	ctx := context.Background()
+	// The publisher rolls back: nobody hears of it.
+	_ = tx.Do(ctx, func(ctx context.Context) error {
+		_ = events.Publish(ctx, "sales.invoice.posted", 1, map[string]string{"number": "INV-0"})
+		return errors.New("rolled back")
+	})
+	if n := count(t, db, "SELECT COUNT(*) FROM kernel_tasks"); n != 0 {
+		t.Fatalf("deliveries of a rolled-back event exist (%d)", n)
+	}
+	if err := tx.Do(ctx, func(ctx context.Context) error {
+		_, _ = tx.Conn(ctx).ExecContext(ctx, "INSERT INTO notes (body) VALUES ('invoice')")
+		return events.Publish(ctx, "sales.invoice.posted", 1, map[string]string{"number": "INV-1"})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	tasks.Start(ctx)
+	defer stop(t, tasks)
+	waitFor(t, "the steady subscriber", func() bool { return steady.Load() == 1 })
+	for i := 0; i < 2; i++ { // speed up the failing subscriber's retries
+		waitFor(t, "a retry to be scheduled", func() bool {
+			return count(t, db, "SELECT COUNT(*) FROM kernel_tasks WHERE kind = 'event:ledger.post' AND status = 'ready' AND attempts = ?", i+1) == 1
+		})
+		_, _ = db.Exec("UPDATE kernel_tasks SET run_at = UTC_TIMESTAMP(6) WHERE kind = 'event:ledger.post'")
+		tasks.signal(LaneShort)
+	}
+	waitFor(t, "the ledger", func() bool { return count(t, db, "SELECT COUNT(*) FROM kernel_tasks WHERE status = 'done'") == 2 })
+	if steady.Load() != 1 || count(t, db, "SELECT COUNT(*) FROM notes WHERE body = 'ledger'") != 1 || count(t, db, "SELECT COUNT(*) FROM notes WHERE body = 'invoice'") != 1 {
+		t.Fatalf("steady=%d notes=%d", steady.Load(), count(t, db, "SELECT COUNT(*) FROM notes"))
+	}
+}
+
+func TestMySQLCalendarTickRunsOnceAcrossContainers(t *testing.T) {
+	db := mysqlDB(t)
+	clock := NewClock(time.UTC)
+	var runs atomic.Int32
+	tick := time.Date(2026, 3, 1, 2, 0, 0, 0, time.UTC)
+	var wg sync.WaitGroup
+	for range 3 { // three containers on one database
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s := NewJobsSlot(db, "test", clock, quietLog())
+			j := &calJob{name: "test.daily", spec: calSpec{kind: calDaily, hour: 2}, timeout: time.Minute,
+				fn: func(context.Context) error { runs.Add(1); time.Sleep(100 * time.Millisecond); return nil }}
+			s.ensureSchedule(context.Background(), j)
+			s.fire(context.Background(), j, tick)
+		}()
+	}
+	wg.Wait()
+	if runs.Load() != 1 {
+		t.Fatalf("the tick ran %d times", runs.Load())
+	}
+	if count(t, db, "SELECT COUNT(*) FROM kernel_schedule_runs WHERE ok = TRUE") != 1 || count(t, db, "SELECT COUNT(*) FROM kernel_schedules WHERE last_success_at IS NOT NULL") != 1 {
+		t.Fatal("the run or the schedule's success was not recorded")
+	}
+	// A failing tick is counted, never switched off.
+	s := NewJobsSlot(db, "test", clock, quietLog())
+	j := &calJob{name: "test.daily", spec: calSpec{kind: calDaily, hour: 2}, timeout: time.Minute, fn: func(context.Context) error { return errors.New("down") }}
+	s.fire(context.Background(), j, tick.Add(24*time.Hour))
+	if count(t, db, "SELECT failures FROM kernel_schedules WHERE name = 'test.daily'") != 1 {
+		t.Fatal("failure not counted")
+	}
+}
+
+func TestMySQLTxFailsWhenADeadlockIsSwallowed(t *testing.T) {
+	db := mysqlDB(t)
+	tx := NewTxSlot(db, quietLog())
+	aLocked, bLocked := make(chan struct{}), make(chan struct{})
+	bDone := make(chan error, 1)
+	go func() { // another request: heavier, so MySQL picks the Do as the deadlock victim
+		<-aLocked
+		other, err := db.BeginTx(context.Background(), nil)
+		if err != nil {
+			bDone <- err
+			return
+		}
+		_, _ = other.Exec("INSERT INTO things (id) VALUES (10), (11), (12), (13), (14), (15), (16), (17)")
+		_, _ = other.Exec("UPDATE things SET n = n + 1 WHERE id = 2")
+		close(bLocked)
+		time.Sleep(200 * time.Millisecond) // the Do is now waiting for row 2
+		if _, err := other.Exec("UPDATE things SET n = n + 1 WHERE id = 1"); err != nil {
+			_ = other.Rollback()
+			bDone <- err
+			return
+		}
+		bDone <- other.Commit()
+	}()
+	attempts := 0
+	err := tx.Do(context.Background(), func(ctx context.Context) error {
+		attempts++
+		c := tx.Conn(ctx)
+		var n int
+		_ = c.QueryRowContext(ctx, "SELECT n FROM things WHERE id = 1 FOR UPDATE").Scan(&n)
+		_, _ = c.ExecContext(ctx, "INSERT INTO notes (body) VALUES ('before')")
+		if attempts == 1 {
+			close(aLocked)
+			<-bLocked
+			// The deadlock surfaces in Scan — and the code ignores it, as code does.
+			_ = c.QueryRowContext(ctx, "SELECT n FROM things WHERE id = 2 FOR UPDATE").Scan(&n)
+		}
+		_, err := c.ExecContext(ctx, "INSERT INTO notes (body) VALUES ('after')")
+		if attempts == 1 && err == nil {
+			t.Error("a statement ran after the deadlock — in autocommit")
+		}
+		return nil // swallowed
+	})
+	if err := <-bDone; err != nil {
+		t.Fatalf("the other transaction: %v", err)
+	}
+	if err != nil || attempts != 2 {
+		t.Fatalf("err=%v attempts=%d", err, attempts)
+	}
+	if n := count(t, db, "SELECT COUNT(*) FROM notes"); n != 2 {
+		t.Fatalf("notes = %d, want only the retry's two", n)
+	}
+}
+
+func TestMySQLReclaimFailsATaskOnItsLastAttempt(t *testing.T) {
+	db, _, tasks, _, _ := mysqlKernel(t)
+	tasks.Register("test.crash", func(context.Context, Task) error { return nil }, TaskKind{MaxAttempts: 2})
+	ctx := context.Background()
+	_ = tasks.Enqueue(ctx, "test.crash", nil)
+	_, _ = db.Exec("UPDATE kernel_tasks SET status = 'running', lease_token = 'dead', locked_until = UTC_TIMESTAMP(6) - INTERVAL 1 SECOND, attempts = 2")
+	if err := tasks.reclaim(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if count(t, db, "SELECT COUNT(*) FROM kernel_tasks WHERE status = 'failed' AND last_error LIKE '%lease expired%'") != 1 {
+		t.Fatal("a task that used its last attempt was put back in the queue")
+	}
+}
+
+func TestMySQLShutdownReleasesARunningTask(t *testing.T) {
+	db, _, tasks, _, _ := mysqlKernel(t)
+	started := make(chan struct{})
+	tasks.Register("test.long", func(ctx context.Context, task Task) error {
+		close(started)
+		<-ctx.Done()
+		return ctx.Err()
+	}, TaskKind{})
+	ctx := context.Background()
+	_ = tasks.Enqueue(ctx, "test.long", nil)
+	tasks.Start(ctx)
+	<-started
+	stopCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancel()
+	if err := tasks.Stop(stopCtx); err == nil {
+		t.Fatal("Stop did not report the task it cut short")
+	}
+	if count(t, db, "SELECT COUNT(*) FROM kernel_tasks WHERE status = 'ready' AND attempts = 0 AND lease_token IS NULL AND run_at <= UTC_TIMESTAMP(6)") != 1 {
+		t.Fatal("the task cut short by shutdown is not back in the queue, its attempt uncounted")
+	}
+}
+
+func TestMySQLCalendarRecoversCutShortAndAbandonedTicks(t *testing.T) {
+	db := mysqlDB(t)
+	s := NewJobsSlot(db, "test", NewClock(time.UTC), quietLog())
+	var runs atomic.Int32
+	j := &calJob{name: "test.close", spec: calSpec{kind: calDaily, hour: 2}, timeout: time.Minute,
+		fn: func(ctx context.Context) error { runs.Add(1); <-ctx.Done(); return ctx.Err() }}
+	s.ensureSchedule(context.Background(), j)
+	tick := time.Date(2026, 3, 1, 2, 0, 0, 0, time.UTC)
+	// Shutdown cuts the run short: the tick is forgotten so the next start runs it.
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { time.Sleep(100 * time.Millisecond); cancel() }()
+	s.fire(ctx, j, tick)
+	if count(t, db, "SELECT COUNT(*) FROM kernel_schedule_runs") != 0 {
+		t.Fatal("a tick cut short by shutdown still counts as run")
+	}
+	// A container died mid-run: once past its timeout, another takes the tick over.
+	j.fn = func(context.Context) error { runs.Add(1); return nil }
+	_, _ = db.Exec("INSERT INTO kernel_schedule_runs (name, scheduled_for, started_at) VALUES ('test.close', ?, UTC_TIMESTAMP(6))", tick)
+	s.fire(context.Background(), j, tick)
+	if runs.Load() != 1 {
+		t.Fatal("a tick still within its timeout was taken over")
+	}
+	_, _ = db.Exec("UPDATE kernel_schedule_runs SET started_at = UTC_TIMESTAMP(6) - INTERVAL 2 HOUR")
+	s.fire(context.Background(), j, tick)
+	if runs.Load() != 2 || count(t, db, "SELECT COUNT(*) FROM kernel_schedule_runs WHERE ok = TRUE") != 1 {
+		t.Fatalf("the abandoned tick was not taken over (runs=%d)", runs.Load())
+	}
+}
+
+func TestMySQLCalendarNeverCatchesUpATickFromBeforeTheJob(t *testing.T) {
+	db := mysqlDB(t)
+	s := NewJobsSlot(db, "test", NewClock(time.UTC), quietLog())
+	var runs atomic.Int32
+	now := time.Now().UTC()
+	at := now.Add(-time.Hour) // today's tick passed an hour ago — before this job existed
+	j := &calJob{name: "test.new", spec: calSpec{kind: calDaily, hour: at.Hour(), minute: at.Minute()}, timeout: time.Minute,
+		catchUp: 24 * time.Hour, fn: func(context.Context) error { runs.Add(1); return nil }}
+	ctx, cancel := context.WithCancel(context.Background())
+	s.wg.Add(1)
+	go s.calendarLoop(ctx, j)
+	waitFor(t, "the schedule", func() bool { return count(t, db, "SELECT COUNT(*) FROM kernel_schedules WHERE name = 'test.new'") == 1 })
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+	s.wg.Wait()
+	if runs.Load() != 0 {
+		t.Fatal("a new job caught up a tick from before it was deployed")
+	}
+	// Once the job exists, a tick it missed is caught up.
+	_, _ = db.Exec("UPDATE kernel_schedules SET created_at = ? WHERE name = 'test.new'", now.Add(-48*time.Hour))
+	ctx, cancel = context.WithCancel(context.Background())
+	s.wg.Add(1)
+	go s.calendarLoop(ctx, j)
+	waitFor(t, "the catch-up", func() bool { return runs.Load() == 1 })
+	cancel()
+	s.wg.Wait()
+}
+
+func TestMySQLCalendarTakesOverATickADeadContainerLeft(t *testing.T) {
+	db := mysqlDB(t)
+	defer func(d time.Duration) { recheck = d }(recheck)
+	recheck = 100 * time.Millisecond
+	s := NewJobsSlot(db, "test", NewClock(time.UTC), quietLog())
+	var runs atomic.Int32
+	now := time.Now().UTC()
+	at := now.Add(-time.Hour)
+	j := &calJob{name: "test.close", spec: calSpec{kind: calDaily, hour: at.Hour(), minute: at.Minute()}, timeout: time.Minute,
+		catchUp: 24 * time.Hour, fn: func(context.Context) error { runs.Add(1); return nil }}
+	tick := j.spec.prev(now, time.UTC)
+	_, _ = db.Exec("INSERT INTO kernel_schedules (name, spec, created_at, updated_at) VALUES ('test.close', '', ?, ?)", now.Add(-48*time.Hour), now)
+	// A container started the tick and was killed; this one restarts before its timeout passes.
+	_, _ = db.Exec("INSERT INTO kernel_schedule_runs (name, scheduled_for, started_at) VALUES ('test.close', ?, UTC_TIMESTAMP(6) - INTERVAL 119500000 MICROSECOND)", tick)
+	ctx, cancel := context.WithCancel(context.Background())
+	s.wg.Add(1)
+	go s.calendarLoop(ctx, j)
+	waitFor(t, "the takeover", func() bool { return runs.Load() == 1 })
+	time.Sleep(300 * time.Millisecond)
+	cancel()
+	s.wg.Wait()
+	if runs.Load() != 1 || count(t, db, "SELECT COUNT(*) FROM kernel_schedule_runs WHERE ok = TRUE") != 1 {
+		t.Fatalf("runs=%d", runs.Load())
+	}
+}
+
+func TestMySQLDedupeQueuesBehindARunningTask(t *testing.T) {
+	db, _, tasks, _, _ := mysqlKernel(t)
+	running, release := make(chan struct{}), make(chan struct{})
+	var runs atomic.Int32
+	tasks.Register("test.recompute", func(ctx context.Context, task Task) error {
+		if runs.Add(1) == 1 {
+			close(running)
+			<-release
+		}
+		return nil
+	}, TaskKind{})
+	ctx := context.Background()
+	_ = tasks.Enqueue(ctx, "test.recompute", nil, Dedupe("k"))
+	tasks.Start(ctx)
+	defer stop(t, tasks)
+	<-running
+	// A change committed while the recompute runs: it must be recomputed again.
+	_ = tasks.Enqueue(ctx, "test.recompute", nil, Dedupe("k"))
+	_ = tasks.Enqueue(ctx, "test.recompute", nil, Dedupe("k")) // waits already: a no-op
+	if n := count(t, db, "SELECT COUNT(*) FROM kernel_tasks WHERE status = 'ready'"); n != 1 {
+		t.Fatalf("waiting tasks = %d, want 1", n)
+	}
+	close(release)
+	waitFor(t, "both runs", func() bool { return count(t, db, "SELECT COUNT(*) FROM kernel_tasks WHERE status = 'done'") == 2 })
+	if runs.Load() != 2 {
+		t.Fatalf("runs = %d", runs.Load())
+	}
+}
+
+func TestMySQLARetryWaitingBehindANewerTaskIsSuperseded(t *testing.T) {
+	db, _, tasks, _, _ := mysqlKernel(t)
+	tasks.Register("test.flaky", func(context.Context, Task) error { return nil }, TaskKind{})
+	ctx := context.Background()
+	_ = tasks.Enqueue(ctx, "test.flaky", nil, Dedupe("k"))
+	// The first is running (claimed by a worker); a newer one with its key waits.
+	_, _ = db.Exec("UPDATE kernel_tasks SET status = 'running', lease_token = 'mine', locked_until = UTC_TIMESTAMP(6) + INTERVAL 1 MINUTE, attempts = 1")
+	_ = tasks.Enqueue(ctx, "test.flaky", nil, Dedupe("k"))
+	var id int64
+	_ = db.QueryRow("SELECT id FROM kernel_tasks WHERE status = 'running'").Scan(&id)
+	tasks.fail(&claimed{id: id, token: "mine", attempts: 1, kind: tasks.kinds["test.flaky"]}, errors.New("boom"))
+	if count(t, db, "SELECT COUNT(*) FROM kernel_tasks WHERE status = 'done' AND last_error LIKE 'superseded%'") != 1 ||
+		count(t, db, "SELECT COUNT(*) FROM kernel_tasks WHERE status = 'ready'") != 1 {
+		t.Fatal("the failed task did not give way to the newer one")
+	}
+}
+
+func TestMySQLCalendarGivesWayToATakeoverWhileWaitingForASlot(t *testing.T) {
+	db := mysqlDB(t)
+	s := NewJobsSlot(db, "test", NewClock(time.UTC), quietLog())
+	var runs atomic.Int32
+	j := &calJob{name: "test.close", spec: calSpec{kind: calDaily, hour: 2}, timeout: time.Minute,
+		fn: func(context.Context) error { runs.Add(1); return nil }}
+	tick := time.Date(2026, 3, 1, 2, 0, 0, 0, time.UTC)
+	for range cap(s.sem) {
+		s.sem <- struct{}{} // every run slot busy with other jobs
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.fire(context.Background(), j, tick)
+	}()
+	waitFor(t, "the claim", func() bool { return count(t, db, "SELECT COUNT(*) FROM kernel_schedule_runs") == 1 })
+	// Meanwhile another container took the tick over (the wait outlasted the timeout).
+	_, _ = db.Exec("UPDATE kernel_schedule_runs SET started_at = started_at + INTERVAL 1 SECOND")
+	for range cap(s.sem) {
+		<-s.sem
+	}
+	<-done
+	if runs.Load() != 0 {
+		t.Fatal("the tick ran here too, after another container took it over")
+	}
+}

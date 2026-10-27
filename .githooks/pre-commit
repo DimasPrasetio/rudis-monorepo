@@ -1,0 +1,6 @@
+#!/bin/sh
+# Refuses a commit that leaves rudis-monorepo out of step with itself or with the module
+# library's contract (rules: AGENTS.md).
+# Enable once per clone: git config core.hooksPath .githooks
+out=$(node scripts/check-drift.mjs 2>&1) || { echo "$out"; exit 1; }
+node scripts/package.mjs --check

@@ -1,0 +1,764 @@
+package kernel
+
+import (
+	"context"
+	"crypto/rand"
+	"database/sql"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	mathrand "math/rand/v2"
+	"regexp"
+	"runtime/debug"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/go-sql-driver/mysql"
+
+	"__GO_MODULE__/internal/shared/request"
+)
+
+// Lane is a queue of tasks with its own workers: short work never waits behind long work.
+type Lane string
+
+const (
+	LaneShort Lane = "short" // quick work and event delivery
+	LaneLong  Lane = "long"  // exports, payroll runs, reposting
+)
+
+// workersPerLane bounds task work to 3 connections; with the 2 job slots (an interval job holds
+// its lock's connection too) background work stays near half of the pool's 10 — requests come
+// first.
+var workersPerLane = map[Lane]int{LaneShort: 2, LaneLong: 1}
+
+// TaskKind is how a kind of task runs.
+type TaskKind struct {
+	Lane        Lane          // default LaneShort
+	Concurrency int           // at most this many at once in this process; default: the lane's workers
+	Timeout     time.Duration // default 60 s (short), 30 min (long)
+	MaxAttempts int           // default 5; then the task is failed and waits for an administrator
+	// NonTransactional runs the handler outside a transaction — for long work that commits in
+	// batches itself. Its database effects may then happen twice: the handler must be idempotent.
+	NonTransactional bool
+}
+
+// Task is one unit of background work as its handler receives it.
+type Task struct {
+	ID      int64
+	Kind    string // "<module>.<task>"
+	Payload json.RawMessage
+	Attempt int // 1 on the first run
+}
+
+// TaskHandler does a task. By default it runs inside d.Tx: what it writes and the task's
+// "done" commit together, so its database effects happen exactly once. Effects outside the
+// database (email, an API) can repeat after a crash: make them idempotent.
+type TaskHandler func(ctx context.Context, t Task) error
+
+// TaskInfo is a task as the administrator's view shows it.
+type TaskInfo struct {
+	ID        int64     `json:"id"`
+	Kind      string    `json:"kind"`
+	Lane      Lane      `json:"lane"`
+	Status    string    `json:"status"`
+	Attempts  int       `json:"attempts"`
+	RunAt     time.Time `json:"run_at"`
+	LastError string    `json:"last_error"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// TaskFilter narrows List.
+type TaskFilter struct {
+	Status string // ready | running | done | failed; empty: all
+	Kind   string
+	Limit  int
+	Offset int
+}
+
+// ErrTaskNotFailed means Retry or Discard found no failed task with that ID.
+var ErrTaskNotFailed = errors.New("task not found or not failed")
+
+// ErrTaskDuplicate means Retry found a task with the same dedupe key already waiting.
+var ErrTaskDuplicate = errors.New("a task with the same dedupe key is already waiting")
+
+var errLeaseLost = errors.New("task lease lost — another worker took it over")
+
+var validKind = regexp.MustCompile(`^[a-z][a-z0-9-]*[.:][a-z0-9][a-z0-9_.:-]*$`)
+
+// envelope is what a task carries from the request that started it.
+type envelope struct {
+	ActorID   int64  `json:"actor_id,omitempty"`
+	CompanyID int64  `json:"company_id,omitempty"` // 0: enqueued without a scope — the task runs without one too
+	BranchID  int64  `json:"branch_id,omitempty"`
+	TZ        string `json:"tz,omitempty"`
+	RequestID string `json:"request_id,omitempty"`
+}
+
+type taskKind struct {
+	TaskKind
+	name string
+	h    TaskHandler
+}
+
+// memTask is a task waiting in memory (no database): what tests run with RunPending.
+type memTask struct {
+	Task
+	env    envelope
+	dedupe string
+}
+
+type claimed struct {
+	id       int64
+	kind     *taskKind
+	payload  json.RawMessage
+	env      envelope
+	attempts int
+	token    string
+}
+
+// TasksSlot is the background work queue every module reaches through Deps.Tasks: a MySQL
+// table (kernel_tasks), claimed with SELECT … FOR UPDATE SKIP LOCKED, so it survives restarts
+// and deploys and runs each task in one place at a time. Enqueue inside d.Tx writes the task in
+// the caller's transaction: it exists only if that transaction commits.
+type TasksSlot struct {
+	db    *sql.DB // nil in tests: tasks wait in memory for RunPending
+	tx    *TxSlot
+	auth  *AuthSlot
+	clock Clock
+	log   *slog.Logger
+
+	mu      sync.Mutex
+	kinds   map[string]*taskKind
+	running map[string]int
+	started bool
+	memory  []memTask // without a database
+	lastID  int64
+
+	claimMu   map[Lane]*sync.Mutex
+	wake      map[Lane]chan struct{}
+	stopping  chan struct{}
+	stopClaim sync.Once
+	execCtx   context.Context
+	cancel    context.CancelFunc
+	wg        sync.WaitGroup
+}
+
+// NewTasksSlot returns the slot. It registers its own upkeep (reclaiming tasks whose worker
+// died, purging done ones) on jobs.
+func NewTasksSlot(db *sql.DB, tx *TxSlot, auth *AuthSlot, jobs *JobsSlot, clock Clock, log *slog.Logger) *TasksSlot {
+	s := &TasksSlot{
+		db: db, tx: tx, auth: auth, clock: clock, log: log,
+		kinds: map[string]*taskKind{}, running: map[string]int{},
+		claimMu: map[Lane]*sync.Mutex{LaneShort: {}, LaneLong: {}},
+		wake:    map[Lane]chan struct{}{LaneShort: make(chan struct{}, 1), LaneLong: make(chan struct{}, 1)},
+	}
+	if db != nil && jobs != nil {
+		jobs.Every("kernel.tasks-reclaim", time.Minute, s.reclaim)
+		jobs.Every("kernel.tasks-purge", 6*time.Hour, s.purge)
+	}
+	return s
+}
+
+// Register declares a kind of task and its handler. Call it in the module's New; kinds are
+// "<module>.<task>" and unique app-wide.
+func (s *TasksSlot) Register(kind string, h TaskHandler, k TaskKind) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.started {
+		panic(fmt.Sprintf("tasks: %q registered after start — call d.Tasks.Register in New", kind))
+	}
+	if !validKind.MatchString(kind) || len(kind) > 100 {
+		panic(fmt.Sprintf("tasks: kind %q must be <module>.<task> (lowercase, at most 100 characters)", kind))
+	}
+	if _, dup := s.kinds[kind]; dup {
+		panic(fmt.Sprintf("tasks: %q registered twice", kind))
+	}
+	if k.Lane == "" {
+		k.Lane = LaneShort
+	}
+	if _, ok := workersPerLane[k.Lane]; !ok {
+		panic(fmt.Sprintf("tasks: %q has unknown lane %q", kind, k.Lane))
+	}
+	if k.Concurrency <= 0 || k.Concurrency > workersPerLane[k.Lane] {
+		k.Concurrency = workersPerLane[k.Lane]
+	}
+	if k.Timeout <= 0 {
+		k.Timeout = time.Minute
+		if k.Lane == LaneLong {
+			k.Timeout = 30 * time.Minute
+		}
+	}
+	if k.MaxAttempts <= 0 {
+		k.MaxAttempts = 5
+	}
+	s.kinds[kind] = &taskKind{TaskKind: k, name: kind, h: h}
+}
+
+// EnqueueOption adjusts one Enqueue.
+type EnqueueOption func(*enqueueOptions)
+
+type enqueueOptions struct {
+	runAt  time.Time
+	after  time.Duration
+	dedupe string
+}
+
+// At runs the task no earlier than t.
+func At(t time.Time) EnqueueOption { return func(o *enqueueOptions) { o.runAt = t } }
+
+// After runs the task no earlier than d from now (by d.Clock).
+func After(d time.Duration) EnqueueOption { return func(o *enqueueOptions) { o.after = d } }
+
+// Dedupe keeps at most one *waiting* task of this kind with key: enqueueing another while one
+// waits is a no-op. Once it runs, a new one is queued behind it — so work that reads the
+// current state when it starts (a recompute) sees every change. A task that would wait again
+// (a retry) while a newer one with its key waits is closed as superseded.
+func Dedupe(key string) EnqueueOption { return func(o *enqueueOptions) { o.dedupe = key } }
+
+// Enqueue adds a task. Inside d.Tx it is written in that transaction — it exists only if the
+// transaction commits — and the workers are woken after the commit. payload is stored as JSON.
+func (s *TasksSlot) Enqueue(ctx context.Context, kind string, payload any, opts ...EnqueueOption) error {
+	s.mu.Lock()
+	k := s.kinds[kind]
+	s.mu.Unlock()
+	if k == nil {
+		return fmt.Errorf("tasks: %q is not registered", kind)
+	}
+	var o enqueueOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("tasks: %s payload: %w", kind, err)
+	}
+	if len(o.dedupe) > 191 {
+		return fmt.Errorf("tasks: %s dedupe key longer than 191 characters", kind)
+	}
+	if s.db == nil {
+		// As with the table: the task exists only if the transaction commits.
+		env := s.capture(ctx)
+		s.tx.AfterCommit(ctx, func(context.Context) {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			for _, m := range s.memory {
+				if o.dedupe != "" && m.Kind == kind && m.dedupe == o.dedupe {
+					return
+				}
+			}
+			s.lastID++
+			s.memory = append(s.memory, memTask{Task: Task{ID: s.lastID, Kind: kind, Payload: body, Attempt: 1}, env: env, dedupe: o.dedupe})
+		})
+		return nil
+	}
+	if !s.tx.InTx(ctx) {
+		// A transaction of its own, retried after a deadlock (a dedupe insert takes gap locks).
+		return s.tx.Do(ctx, func(ctx context.Context) error { return s.Enqueue(ctx, kind, payload, opts...) })
+	}
+	env, err := json.Marshal(s.capture(ctx))
+	if err != nil {
+		return err
+	}
+	now := s.clock.Now()
+	runAt := now.Add(o.after)
+	if o.runAt.After(runAt) {
+		runAt = o.runAt.UTC()
+	}
+	var dedupe any
+	if o.dedupe != "" {
+		dedupe = o.dedupe
+	}
+	if _, err := s.tx.Conn(ctx).ExecContext(ctx,
+		`INSERT INTO kernel_tasks (kind, lane, status, payload, envelope, dedupe_key, attempts, max_attempts, run_at, created_at, updated_at)
+		 VALUES (?, ?, 'ready', ?, ?, ?, 0, ?, ?, ?, ?)
+		 ON DUPLICATE KEY UPDATE id = id`,
+		kind, string(k.Lane), string(body), string(env), dedupe, k.MaxAttempts, runAt, now, now); err != nil {
+		return fmt.Errorf("tasks: enqueue %s: %w", kind, err)
+	}
+	s.tx.AfterCommit(ctx, func(context.Context) { s.signal(k.Lane) })
+	return nil
+}
+
+// capture records who and where the work comes from, to restore it when the task runs.
+func (s *TasksSlot) capture(ctx context.Context) envelope {
+	e := envelope{RequestID: request.RequestID(ctx)}
+	if HasScope(ctx) {
+		sc := ScopeFrom(ctx)
+		e.CompanyID, e.BranchID = sc.CompanyID, sc.BranchID
+		if sc.Location != nil {
+			e.TZ = sc.Location.String()
+		}
+	}
+	if s.auth != nil {
+		e.ActorID, _ = s.auth.UserID(ctx)
+	}
+	if e.ActorID == 0 {
+		e.ActorID = ActorFrom(ctx)
+	}
+	return e
+}
+
+func restore(ctx context.Context, e envelope) context.Context {
+	if e.CompanyID > 0 {
+		sc := Scope{CompanyID: e.CompanyID, BranchID: e.BranchID}
+		if e.TZ != "" {
+			if loc, err := time.LoadLocation(e.TZ); err == nil {
+				sc.Location = loc
+			}
+		}
+		ctx = WithScope(ctx, sc)
+	}
+	if e.ActorID != 0 {
+		ctx = withActor(ctx, e.ActorID)
+	}
+	if e.RequestID != "" {
+		ctx = request.WithRequestID(ctx, e.RequestID)
+	}
+	return ctx
+}
+
+func (s *TasksSlot) signal(l Lane) {
+	select {
+	case s.wake[l] <- struct{}{}:
+	default:
+	}
+}
+
+// Start runs the workers. Called once by cmd/server after the modules are built.
+func (s *TasksSlot) Start(ctx context.Context) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.started {
+		return
+	}
+	s.started = true
+	if s.db == nil {
+		return
+	}
+	s.stopping = make(chan struct{})
+	s.execCtx, s.cancel = context.WithCancel(ctx)
+	for lane, n := range workersPerLane {
+		for range n {
+			s.wg.Add(1)
+			go s.worker(lane)
+		}
+	}
+}
+
+// StopClaiming stops taking new tasks — called as soon as shutdown starts, while requests drain.
+func (s *TasksSlot) StopClaiming() {
+	s.mu.Lock()
+	stopping := s.stopping
+	s.mu.Unlock()
+	if stopping != nil {
+		s.stopClaim.Do(func() { close(stopping) })
+	}
+}
+
+// Stop stops claiming, lets running tasks finish until ctx ends, then cancels them; a cancelled
+// task is put back in the queue at once, its attempt not counted.
+func (s *TasksSlot) Stop(ctx context.Context) error {
+	s.mu.Lock()
+	cancel := s.cancel
+	s.mu.Unlock()
+	if cancel == nil {
+		return nil
+	}
+	s.StopClaiming()
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		cancel()
+		return nil
+	case <-ctx.Done():
+		cancel() // a cancelled task goes back in the queue
+		select {
+		case <-done:
+			return fmt.Errorf("tasks: cut short at shutdown: %w", ctx.Err())
+		case <-time.After(3 * time.Second):
+			return errors.New("tasks: a handler ignored its cancelled context and was abandoned; its task is reclaimed when its lease ends")
+		}
+	}
+}
+
+func (s *TasksSlot) worker(lane Lane) {
+	defer s.wg.Done()
+	poll := time.Second
+	if lane == LaneLong {
+		poll = 5 * time.Second
+	}
+	ticker := time.NewTicker(poll)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.stopping:
+			return
+		default:
+		}
+		c, err := s.claim(lane)
+		if err != nil && s.execCtx.Err() == nil {
+			s.log.Warn("tasks: claim failed", "lane", lane, "err", err)
+		}
+		if c != nil {
+			s.execute(c)
+			continue
+		}
+		select {
+		case <-s.stopping:
+			return
+		case <-s.wake[lane]:
+		case <-ticker.C:
+		}
+	}
+}
+
+// claim takes the next due task of lane whose kind has room, under a lease.
+func (s *TasksSlot) claim(lane Lane) (*claimed, error) {
+	m := s.claimMu[lane]
+	m.Lock()
+	defer m.Unlock()
+	s.mu.Lock()
+	var eligible []any
+	for name, k := range s.kinds {
+		if k.Lane == lane && s.running[name] < k.Concurrency {
+			eligible = append(eligible, name)
+		}
+	}
+	s.mu.Unlock()
+	if len(eligible) == 0 {
+		return nil, nil
+	}
+	ctx, cancel := context.WithTimeout(s.execCtx, 10*time.Second)
+	defer cancel()
+	// READ COMMITTED: the locking read takes no gap locks, so it never blocks an Enqueue.
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback() //nolint:errcheck // a no-op after Commit
+	now := s.clock.Now()
+	args := append([]any{string(lane), now}, eligible...)
+	var c claimed
+	var kind string
+	var env []byte
+	err = tx.QueryRowContext(ctx,
+		`SELECT id, kind, payload, envelope, attempts FROM kernel_tasks
+		 WHERE lane = ? AND status = 'ready' AND run_at <= ? AND kind IN (?`+strings.Repeat(",?", len(eligible)-1)+`)
+		 ORDER BY run_at, id LIMIT 1 FOR UPDATE SKIP LOCKED`, args...).Scan(&c.id, &kind, &c.payload, &env, &c.attempts)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, tx.Commit()
+	}
+	if err != nil {
+		return nil, err
+	}
+	_ = json.Unmarshal(env, &c.env)
+	s.mu.Lock()
+	c.kind = s.kinds[kind]
+	s.mu.Unlock()
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	c.token = hex.EncodeToString(b)
+	// The lease outlasts the timeout, so a task still within its time is never reclaimed.
+	lease := now.Add(c.kind.Timeout + time.Minute)
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE kernel_tasks SET status = 'running', lease_token = ?, locked_until = ?, attempts = attempts + 1, updated_at = ? WHERE id = ?`,
+		c.token, lease, now, c.id); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	c.attempts++
+	s.mu.Lock()
+	s.running[kind]++
+	s.mu.Unlock()
+	return &c, nil
+}
+
+func (s *TasksSlot) execute(c *claimed) {
+	defer func() {
+		s.mu.Lock()
+		s.running[c.kind.name]--
+		s.mu.Unlock()
+	}()
+	ctx, cancel := context.WithTimeout(restore(s.execCtx, c.env), c.kind.Timeout)
+	defer cancel()
+	t := Task{ID: c.id, Kind: c.kind.name, Payload: c.payload, Attempt: c.attempts}
+	var err error
+	if c.kind.NonTransactional {
+		if err = call(ctx, c.kind.h, t); err == nil {
+			err = s.finish(ctx, s.db, c)
+		}
+	} else {
+		err = s.tx.Do(ctx, func(ctx context.Context) error {
+			if err := call(ctx, c.kind.h, t); err != nil {
+				return err
+			}
+			return s.finish(ctx, s.tx.Conn(ctx), c)
+		})
+	}
+	if err == nil {
+		return
+	}
+	if errors.Is(err, errLeaseLost) {
+		s.log.Warn("tasks: lease lost", "kind", c.kind.name, "id", c.id)
+		return
+	}
+	if s.execCtx.Err() != nil {
+		s.release(c) // shutting down: not the task's fault
+		return
+	}
+	s.fail(c, err)
+}
+
+// call runs h, turning a panic into an error.
+func call(ctx context.Context, h TaskHandler, t Task) (err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			err = fmt.Errorf("panic: %v\n%s", p, debug.Stack())
+		}
+	}()
+	return h(ctx, t)
+}
+
+// finish marks the task done — only while this worker still holds its lease.
+func (s *TasksSlot) finish(ctx context.Context, db DBTX, c *claimed) error {
+	res, err := db.ExecContext(ctx,
+		`UPDATE kernel_tasks SET status = 'done', lease_token = NULL, locked_until = NULL, last_error = '', updated_at = ? WHERE id = ? AND lease_token = ?`,
+		s.clock.Now(), c.id, c.token)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return errLeaseLost
+	}
+	return nil
+}
+
+// fail schedules the next attempt with a growing wait, or marks the task failed.
+func (s *TasksSlot) fail(c *claimed, cause error) {
+	msg := cause.Error()
+	if len(msg) > 1000 {
+		msg = msg[:1000]
+	}
+	wait := 30 * time.Second << min(c.attempts-1, 7)
+	if wait > time.Hour {
+		wait = time.Hour
+	}
+	wait += time.Duration(mathrand.Int64N(int64(wait/10) + 1))
+	now := s.clock.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := s.toReady(ctx, c.id, "lease_token = ?", c.token,
+		`UPDATE kernel_tasks SET status = IF(attempts >= max_attempts, 'failed', 'ready'), run_at = ?, lease_token = NULL,
+		 locked_until = NULL, last_error = ?, updated_at = ? WHERE id = ? AND lease_token = ?`,
+		now.Add(wait), msg, now, c.id, c.token); err != nil {
+		s.log.Error("tasks: could not record a failure", "kind", c.kind.name, "id", c.id, "err", err)
+	}
+	level := slog.LevelWarn
+	if c.attempts >= c.kind.MaxAttempts {
+		level = slog.LevelError
+	}
+	s.log.Log(ctx, level, "tasks: task failed", "kind", c.kind.name, "id", c.id, "attempt", c.attempts, "of", c.kind.MaxAttempts, "err", msg)
+}
+
+// release puts a task cut short by shutdown back in the queue at once, its attempt not counted.
+func (s *TasksSlot) release(c *claimed) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.toReady(ctx, c.id, "lease_token = ?", c.token,
+		`UPDATE kernel_tasks SET status = 'ready', attempts = GREATEST(attempts - 1, 0), lease_token = NULL, locked_until = NULL, run_at = ?, updated_at = ?
+		 WHERE id = ? AND lease_token = ?`, s.clock.Now(), s.clock.Now(), c.id, c.token); err != nil {
+		s.log.Warn("tasks: could not release a task at shutdown; it is reclaimed when its lease ends", "kind", c.kind.name, "id", c.id, "err", err)
+	}
+}
+
+// reclaim returns tasks whose worker died (lease expired) to the queue — or, when that was
+// their last attempt, marks them failed: a task that keeps killing its worker must stop.
+func (s *TasksSlot) reclaim(ctx context.Context) error {
+	now := s.clock.Now()
+	rows, err := s.db.QueryContext(ctx, `SELECT id FROM kernel_tasks WHERE status = 'running' AND locked_until < ? LIMIT 500`, now)
+	if err != nil {
+		return err
+	}
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, id := range ids {
+		if err := s.toReady(ctx, id, "locked_until < ?", now,
+			`UPDATE kernel_tasks SET status = IF(attempts >= max_attempts, 'failed', 'ready'), lease_token = NULL, locked_until = NULL,
+			 last_error = 'its worker stopped or overran its time (lease expired)', updated_at = ? WHERE id = ? AND status = 'running' AND locked_until < ?`,
+			now, id, now); err != nil {
+			return err
+		}
+	}
+	if len(ids) > 0 {
+		s.log.Warn("tasks: reclaimed tasks whose worker stopped", "count", len(ids))
+		s.signal(LaneShort)
+		s.signal(LaneLong)
+	}
+	return nil
+}
+
+// toReady runs update, which may put task id back in the queue. When a newer task with the same
+// dedupe key already waits, the old one is closed as superseded instead — the newer does the work
+// — while it is still the one update meant (held, which update also requires: its lease, or its
+// expired lease).
+func (s *TasksSlot) toReady(ctx context.Context, id int64, held string, heldArg any, update string, args ...any) error {
+	_, err := s.db.ExecContext(ctx, update, args...)
+	var me *mysql.MySQLError
+	if errors.As(err, &me) && me.Number == 1062 {
+		_, err = s.db.ExecContext(ctx,
+			`UPDATE kernel_tasks SET status = 'done', lease_token = NULL, locked_until = NULL,
+			 last_error = 'superseded: a newer task with the same dedupe key waits', updated_at = ? WHERE id = ? AND status = 'running' AND `+held,
+			s.clock.Now(), id, heldArg)
+	}
+	return err
+}
+
+// purge deletes tasks done more than 7 days ago, in batches.
+func (s *TasksSlot) purge(ctx context.Context) error {
+	before := s.clock.Now().Add(-7 * 24 * time.Hour)
+	for {
+		res, err := s.db.ExecContext(ctx, `DELETE FROM kernel_tasks WHERE status = 'done' AND updated_at < ? LIMIT 1000`, before)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n < 1000 {
+			return nil
+		}
+	}
+}
+
+// List is the queue for an administrator's view, newest first.
+func (s *TasksSlot) List(ctx context.Context, f TaskFilter) ([]TaskInfo, int64, error) {
+	if s.db == nil {
+		return nil, 0, nil
+	}
+	if f.Limit <= 0 || f.Limit > 200 {
+		f.Limit = 50
+	}
+	where, args := "WHERE 1 = 1", []any{}
+	if f.Status != "" {
+		where += " AND status = ?"
+		args = append(args, f.Status)
+	}
+	if f.Kind != "" {
+		where += " AND kind = ?"
+		args = append(args, f.Kind)
+	}
+	var total int64
+	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM kernel_tasks "+where, args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	rows, err := s.db.QueryContext(ctx,
+		"SELECT id, kind, lane, status, attempts, run_at, last_error, created_at, updated_at FROM kernel_tasks "+where+" ORDER BY id DESC LIMIT ? OFFSET ?",
+		append(args, f.Limit, f.Offset)...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	var out []TaskInfo
+	for rows.Next() {
+		var t TaskInfo
+		var lane string
+		if err := rows.Scan(&t.ID, &t.Kind, &lane, &t.Status, &t.Attempts, &t.RunAt, &t.LastError, &t.CreatedAt, &t.UpdatedAt); err != nil {
+			return nil, 0, err
+		}
+		t.Lane = Lane(lane)
+		out = append(out, t)
+	}
+	return out, total, rows.Err()
+}
+
+// Retry queues a failed task again from its first attempt.
+func (s *TasksSlot) Retry(ctx context.Context, id int64) error {
+	now := s.clock.Now()
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE kernel_tasks SET status = 'ready', attempts = 0, run_at = ?, last_error = '', updated_at = ? WHERE id = ? AND status = 'failed'`, now, now, id)
+	var me *mysql.MySQLError
+	if errors.As(err, &me) && me.Number == 1062 {
+		return ErrTaskDuplicate
+	}
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrTaskNotFailed
+	}
+	s.signal(LaneShort)
+	s.signal(LaneLong)
+	return nil
+}
+
+// Discard deletes a failed task.
+func (s *TasksSlot) Discard(ctx context.Context, id int64) error {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM kernel_tasks WHERE id = ? AND status = 'failed'`, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrTaskNotFailed
+	}
+	return nil
+}
+
+// Pending is the tasks enqueued without a database — for tests (kerneltest).
+func (s *TasksSlot) Pending() []Task {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]Task, len(s.memory))
+	for i, m := range s.memory {
+		out[i] = m.Task
+	}
+	return out
+}
+
+// RunPending runs, in order, the tasks enqueued without a database — including the ones they
+// enqueue — and returns how many ran. For tests (kerneltest); the first error stops it.
+func (s *TasksSlot) RunPending(ctx context.Context) (int, error) {
+	ran := 0
+	for {
+		s.mu.Lock()
+		if len(s.memory) == 0 {
+			s.mu.Unlock()
+			return ran, nil
+		}
+		t := s.memory[0]
+		s.memory = s.memory[1:]
+		k := s.kinds[t.Kind]
+		s.mu.Unlock()
+		// As in production: the enqueuing request's actor and scope, inside d.Tx unless the kind
+		// commits by itself.
+		tctx := restore(ctx, t.env)
+		run := func(ctx context.Context) error { return call(ctx, k.h, t.Task) }
+		var err error
+		if k.NonTransactional {
+			err = run(tctx)
+		} else {
+			err = s.tx.Do(tctx, run)
+		}
+		if err != nil {
+			return ran, fmt.Errorf("%s: %w", t.Kind, err)
+		}
+		ran++
+	}
+}

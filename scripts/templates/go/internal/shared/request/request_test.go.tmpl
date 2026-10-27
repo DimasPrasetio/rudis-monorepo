@@ -1,0 +1,80 @@
+package request
+
+import (
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"__GO_MODULE__/internal/shared/apperror"
+)
+
+func decode(contentType, body string) error {
+	r := httptest.NewRequest("POST", "/", strings.NewReader(body))
+	if contentType != "" {
+		r.Header.Set("Content-Type", contentType)
+	}
+	var dst struct {
+		Name string `json:"name"`
+		Age  int    `json:"age"`
+	}
+	return DecodeJSON(httptest.NewRecorder(), r, &dst)
+}
+
+func status(err error) int {
+	var e *apperror.Error
+	if errors.As(err, &e) {
+		return e.Status
+	}
+	return 0
+}
+
+func TestDecodeJSON(t *testing.T) {
+	if err := decode("application/json; charset=utf-8", `{"name":"Ana"}`); err != nil {
+		t.Fatalf("valid JSON refused: %v", err)
+	}
+	// A browser can post these cross-site without CORS — never accepted.
+	for _, ct := range []string{"", "text/plain", "application/x-www-form-urlencoded", "multipart/form-data"} {
+		if got := status(decode(ct, `{"name":"Ana"}`)); got != http.StatusUnsupportedMediaType {
+			t.Errorf("Content-Type %q: got %d, want 415", ct, got)
+		}
+	}
+	err := decode("application/json", `{"age":"x"}`)
+	if status(err) != http.StatusBadRequest || strings.Contains(err.Error(), "struct") {
+		t.Errorf("type error should be a plain 400 without Go internals, got %v", err)
+	}
+	if err := decode("application/json", `{"admin":true}`); !strings.Contains(err.Error(), "admin") {
+		t.Errorf("unknown field should be named, got %v", err)
+	}
+}
+
+func TestAllowTransferOutlivesTheServerTimeout(t *testing.T) {
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Has("allow") {
+			AllowTransfer(w, 10<<20)
+		}
+		time.Sleep(700 * time.Millisecond) // a slow client, as far as the server can tell
+		_, _ = w.Write([]byte("whole file"))
+	}))
+	srv.Config.WriteTimeout = 300 * time.Millisecond
+	srv.Start()
+	defer srv.Close()
+	get := func(path string) string {
+		resp, err := http.Get(srv.URL + path)
+		if err != nil {
+			return ""
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return string(b)
+	}
+	if got := get("/"); got == "whole file" {
+		t.Fatal("the test is wrong: the server timeout did not cut the response")
+	}
+	if got := get("/?allow"); got != "whole file" {
+		t.Fatalf("with AllowTransfer the response was cut: %q", got)
+	}
+}

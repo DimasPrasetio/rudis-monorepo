@@ -1,0 +1,114 @@
+package kernel
+
+import (
+	"context"
+	"log/slog"
+	"sync"
+	"time"
+
+	"__GO_MODULE__/internal/shared/request"
+)
+
+// AuditKind sorts records: what changed, what personal data was read or exported, and security
+// events. UU PDP Art. 46 asks a breach notice to say which data, when, and how — reads and
+// exports of personal data must be on record for that, not only changes.
+type AuditKind string
+
+const (
+	AuditChange   AuditKind = "change"   // the default
+	AuditAccess   AuditKind = "access"   // sensitive personal data viewed (NIK, salary, bank account)
+	AuditExport   AuditKind = "export"   // data downloaded or exported
+	AuditSecurity AuditKind = "security" // failed sign-ins, permission changes, unlocks
+)
+
+// AuditEntry is one change worth answering "who did what, when" for — d.Audit.Record. Never put
+// secrets in Data (passwords, tokens); record what changed, not the whole row.
+type AuditEntry struct {
+	Kind    AuditKind      // empty: AuditChange
+	Module  string         // "users"
+	Action  string         // "<thing>.<verb>", e.g. "user.deactivated"
+	Target  string         // "<type>:<id>", e.g. "user:12"; empty when nothing specific
+	Summary string         // one readable line, e.g. "Menonaktifkan Ana"
+	Data    map[string]any // optional detail, e.g. {"before": …, "after": …}
+	// Actor is who did it, when that is not the signed-in user (a sign-in, a reset by token).
+	// Zero: the signed-in user, if any.
+	Actor int64
+}
+
+// AuditRecord is an entry with what the kernel adds: when, by whom, from where.
+type AuditRecord struct {
+	AuditEntry
+	At        time.Time
+	ActorID   int64 // 0: no one signed in (system, or an anonymous request)
+	IP        string
+	RequestID string
+	CompanyID int64 // the scope the change was made in; 0: none (a system record, with several companies)
+	BranchID  int64
+}
+
+// AuditSink stores records — what an audit module provides.
+type AuditSink interface {
+	Write(ctx context.Context, r AuditRecord) error
+}
+
+// AuditSlot is the audit trail every module receives in Deps.Audit. Like Auth and Authz it is a
+// kernel slot: nearly every module that changes data records it. Without a provider a record is
+// one log line; an audit module (the library's audit-log) stores it with Provide.
+//
+// Inside d.Tx the sink writes in that transaction (it uses d.Tx.Conn with the ctx it receives),
+// so the record commits — or rolls back — with the change. Outside one it is written at once.
+// A failure to store it is logged, never returned.
+type AuditSlot struct {
+	auth  *AuthSlot
+	clock Clock
+	log   *slog.Logger
+	mu    sync.RWMutex
+	sink  AuditSink
+}
+
+// NewAuditSlot returns the slot; it learns who acted through auth.
+func NewAuditSlot(auth *AuthSlot, clock Clock, log *slog.Logger) *AuditSlot {
+	if clock == nil {
+		clock = NewClock(nil)
+	}
+	return &AuditSlot{auth: auth, clock: clock, log: log}
+}
+
+// Provide sets where records go. Called once, from internal/modules/registry.go.
+func (s *AuditSlot) Provide(sink AuditSink) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sink = sink
+}
+
+// Record notes a change.
+func (s *AuditSlot) Record(ctx context.Context, e AuditEntry) {
+	if e.Kind == "" {
+		e.Kind = AuditChange
+	}
+	var sc Scope // none: a system record (company 0) — a sign-in attempt in an app with several companies
+	if HasScope(ctx) || !severalCompanies.Load() {
+		sc = ScopeFrom(ctx)
+	}
+	r := AuditRecord{AuditEntry: e, At: s.clock.Now(), ActorID: e.Actor, IP: request.ClientIPFrom(ctx), RequestID: request.RequestID(ctx),
+		CompanyID: sc.CompanyID, BranchID: sc.BranchID}
+	if r.ActorID == 0 {
+		r.ActorID, _ = s.auth.UserID(ctx)
+	}
+	if r.ActorID == 0 {
+		r.ActorID = ActorFrom(ctx)
+	}
+	s.mu.RLock()
+	sink := s.sink
+	s.mu.RUnlock()
+	if sink == nil {
+		s.log.Info("audit", "kind", r.Kind, "module", r.Module, "action", r.Action, "target", r.Target, "actor", r.ActorID, "summary", r.Summary)
+		return
+	}
+	// The request may be ending; the record should still be written.
+	wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+	defer cancel()
+	if err := sink.Write(wctx, r); err != nil {
+		s.log.Error("audit: record not stored", "module", r.Module, "action", r.Action, "target", r.Target, "err", err)
+	}
+}

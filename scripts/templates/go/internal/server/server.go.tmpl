@@ -1,0 +1,85 @@
+// Package server builds the HTTP server: kernel endpoints, the modules' routes, the SPA, and
+// the middleware around all of them.
+package server
+
+import (
+	"net/http"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
+
+	"__GO_MODULE__/internal/database"
+	"__GO_MODULE__/internal/kernel"
+	"__GO_MODULE__/internal/shared/response"
+)
+
+// New returns the server for d. register mounts the backend modules (modules.Register); its
+// error is returned as is.
+func New(d *kernel.Deps, register func(mux *http.ServeMux) error) (*http.Server, error) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/health", func(w http.ResponseWriter, r *http.Request) {
+		response.OK(w, "ok", nil)
+	})
+	// Readiness probe for the image HEALTHCHECK and deploy.sh: ready only while the database
+	// answers. Unprefixed on purpose — it is infrastructure, not part of the API.
+	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
+		if err := database.Ping(r.Context(), d.DB, 2*time.Second); err != nil {
+			d.Log.Warn("readyz: database unreachable", "err", err)
+			response.Fail(w, http.StatusServiceUnavailable, "Database tidak dapat dihubungi", nil)
+			return
+		}
+		response.OK(w, "ready", nil)
+	})
+
+	if err := register(mux); err != nil {
+		return nil, err
+	}
+	// Modules declared permissions: something must decide them. Refused in production,
+	// warned in development (where "signed in = allowed" keeps a lone module usable).
+	if err := d.Authz.Check(); err != nil {
+		if d.Config.IsProduction() {
+			return nil, err
+		}
+		d.Log.Warn("authz: " + err.Error())
+	}
+
+	// An unknown API path answers a JSON 404 instead of falling through to the SPA.
+	// http.ServeMux picks the most specific pattern, so every route above still wins.
+	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
+		response.Fail(w, http.StatusNotFound, "Rute tidak ditemukan", nil)
+	})
+	if dir := d.Config.PublicDir; dir != "" {
+		if _, err := os.Stat(dir); err == nil {
+			mux.Handle("/", spa(dir))
+		}
+	}
+
+	// Streams (request.AllowStream) end when shutdown starts instead of holding the drain.
+	shutdown := make(chan struct{})
+	mw := []func(http.Handler) http.Handler{requestID(d.Log), clientIP(d.Config.TrustedProxies), logRequests, recoverPanics, sameOrigin, shuttingDown(shutdown)}
+	srv := &http.Server{
+		Addr:              ":" + d.Config.Port,
+		Handler:           chain(mux, append(mw, d.HTTP.Middleware()...)...),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+	var closeOnce sync.Once
+	srv.RegisterOnShutdown(func() { closeOnce.Do(func() { close(shutdown) }) })
+	return srv, nil
+}
+
+// spa serves dir, falling back to index.html for client-side routes.
+func spa(dir string) http.Handler {
+	files := http.FileServer(http.Dir(dir))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := filepath.Join(dir, filepath.Clean("/"+r.URL.Path))
+		if info, err := os.Stat(p); err == nil && !info.IsDir() {
+			files.ServeHTTP(w, r)
+			return
+		}
+		http.ServeFile(w, r, filepath.Join(dir, "index.html"))
+	})
+}

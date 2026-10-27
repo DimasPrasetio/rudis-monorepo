@@ -1,0 +1,120 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"os"
+	"os/signal"
+	"sync"
+	"syscall"
+	"time"
+	// Time zone data inside the binary: APP_TIMEZONE works in the minimal image (~450 KB).
+	_ "time/tzdata"
+
+	"github.com/joho/godotenv"
+
+	"__GO_MODULE__/internal/config"
+	"__GO_MODULE__/internal/database"
+	"__GO_MODULE__/internal/kernel"
+	"__GO_MODULE__/internal/modules"
+	"__GO_MODULE__/internal/server"
+	"__GO_MODULE__/internal/shared/logger"
+)
+
+func main() {
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, "api:", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
+	// .env lives at the repo root; the API runs from apps/api. Errors are ignored:
+	// in the container, env is injected via env_file.
+	_ = godotenv.Load("../../.env")
+	_ = godotenv.Load(".env")
+
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	log := logger.New(cfg.Env)
+
+	// A metrics or tracing kit wraps the driver here: database.Options{Wrap: ...}.
+	db, err := database.OpenWith(cfg.DBDSN, database.Options{})
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	deps := kernel.NewDeps(cfg, db, database.Name(cfg.DBDSN), log, nil)
+	srv, err := server.New(deps, func(mux *http.ServeMux) error { return modules.Register(mux, deps) })
+	if err != nil {
+		return err
+	}
+
+	// docker stop sends SIGTERM: finish in-flight requests before exiting.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// Background work starts once every module has registered its own. Its context is not the
+	// signal's: on SIGTERM tasks stop claiming at once and finish what runs while requests
+	// drain; jobs are cancelled at once (a calendar tick cut short runs again).
+	deps.Tasks.Start(context.Background())
+	deps.Jobs.Start(context.Background())
+
+	errc := make(chan error, 1)
+	go func() {
+		log.Info("api listening", "addr", srv.Addr, "env", cfg.Env)
+		errc <- srv.ListenAndServe()
+	}()
+
+	// 25 s fits inside docker's stop_grace_period (30 s in the prod compose) and lets most
+	// long requests finish; the server's WriteTimeout bounds the rest. A task still running at
+	// the end goes back in the queue for the next container. Requests, tasks, and jobs stop
+	// together — on every way out — then (deferred) the database.
+	stopBackground := func(ctx context.Context) {
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			if err := deps.Tasks.Stop(ctx); err != nil {
+				log.Warn("api: " + err.Error())
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			if err := deps.Jobs.Stop(ctx); err != nil {
+				log.Warn("api: " + err.Error())
+			}
+		}()
+		wg.Wait()
+	}
+
+	select {
+	case err := <-errc:
+		stopCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		stopBackground(stopCtx)
+		return err
+	case <-ctx.Done():
+	}
+
+	deps.Tasks.StopClaiming()
+	shutdown, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		stopBackground(shutdown)
+	}()
+	err = srv.Shutdown(shutdown)
+	<-stopped
+	if err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return err
+	}
+	log.Info("api stopped")
+	return nil
+}

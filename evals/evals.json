@@ -1,0 +1,158 @@
+{
+  "skill_name": "rudis-monorepo",
+  "evals": [
+    {
+      "id": 0,
+      "eval_name": "go-pos-monorepo",
+      "prompt": "Buatkan struktur monorepo untuk aplikasi POS/kasir bernama 'kasir-app'. Backend pakai Go, frontend React. Saya butuh modul auth, users, products, dan orders. Tolong setup struktur folder lengkap beserta file konfigurasi pentingnya. Jangan jalankan npm install / go mod download, cukup buat struktur dan file-nya.",
+      "expected_output": "A monorepo with apps/web (React 19 + Tailwind 4) and apps/api (Go modular monolith using Air, golang-migrate, sqlc, not GORM), CLAUDE.md gateway, knowledge/, .claude/rules/, separate dev:web/dev:api scripts, single-app docker-compose with host DB, .env.example.",
+      "files": [],
+      "assertions": [
+        "Monorepo has both apps/web and apps/api directories",
+        "Root CLAUDE.md exists as an AI gateway",
+        "knowledge/ directory exists with INDEX.md",
+        ".claude/rules/ directory exists",
+        "Root package.json has separate dev:web and dev:api scripts (no single combined dev that runs both, no concurrently)",
+        "Go backend uses Air watcher (.air.toml present)",
+        "Go backend uses golang-migrate (migrations/ with .up.sql/.down.sql) and sqlc (sqlc.yaml), and does NOT use GORM",
+        "Backend follows modular monolith: at least one module exposes a contracts/ boundary",
+        ".env.example present and no real .env containing secrets is committed",
+        "docker-compose.yml defines a single app service and NO mysql/database service",
+        "Frontend uses React 19 + Tailwind 4 with @/* alias and a central Axios http-client"
+      ]
+    },
+    {
+      "id": 1,
+      "eval_name": "nestjs-inventory-monorepo",
+      "prompt": "Saya mau bikin project monorepo baru namanya 'inventory-system'. Backend NestJS, frontend React. Ada modul products dan orders. Tolong generate struktur monorepo standar lengkap. Jangan jalankan npm install, cukup struktur dan file konfigurasinya.",
+      "expected_output": "A monorepo with apps/web (React 19 + Tailwind 4) and apps/api (NestJS modular monolith with Prisma migrations, start:dev watch), CLAUDE.md, knowledge/, .claude/rules/, separate dev scripts, single-app docker-compose, .env.example.",
+      "files": [],
+      "assertions": [
+        "Monorepo has both apps/web and apps/api directories",
+        "Root CLAUDE.md exists as an AI gateway",
+        "knowledge/ directory exists with INDEX.md",
+        ".claude/rules/ directory exists",
+        "Root package.json has separate dev:web and dev:api scripts (no single combined dev, no concurrently)",
+        "NestJS backend uses Prisma (prisma/schema.prisma present), not TypeORM",
+        "NestJS dev uses watch mode (start:dev / nest start --watch)",
+        "Backend follows modular monolith: at least one module exposes a contracts/ boundary",
+        ".env.example present and no real .env containing secrets is committed",
+        "docker-compose.yml defines a single app service and NO mysql/database service",
+        "Frontend uses React 19 + Tailwind 4 with @/* alias and a central Axios http-client"
+      ]
+    },
+    {
+      "id": 2,
+      "eval_name": "express-blog-monorepo",
+      "prompt": "Bikinin monorepo buat aplikasi blog sederhana namanya 'blog-app'. Backend Express/Node, frontend React. Setup struktur project-nya. Jangan jalankan npm install, cukup struktur dan file-nya.",
+      "expected_output": "A monorepo with apps/web (React 19 + Tailwind 4) and apps/api (Express modular monolith using nodemon watcher). Because the Express migration tool is NOT locked by the standard, the output should flag that the migration tool is undecided / ask for clarification rather than silently picking one. CLAUDE.md, knowledge/, .claude/rules/, separate dev scripts, single-app docker-compose, .env.example.",
+      "files": [],
+      "assertions": [
+        "Monorepo has both apps/web and apps/api directories",
+        "Root CLAUDE.md exists as an AI gateway",
+        "knowledge/ directory exists with INDEX.md",
+        ".claude/rules/ directory exists",
+        "Root package.json has separate dev:web and dev:api scripts (no single combined dev, no concurrently)",
+        "Express backend uses nodemon as the dev watcher (not a bare node server.js dev workflow)",
+        "Migration tool is NOT silently chosen: the output explicitly flags it as not-locked or asks for clarification",
+        "Backend follows modular monolith: at least one module exposes a contracts/ boundary",
+        ".env.example present and no real .env containing secrets is committed",
+        "docker-compose.yml defines a single app service and NO mysql/database service",
+        "Frontend uses React 19 + Tailwind 4 with @/* alias and a central Axios http-client"
+      ]
+    },
+    {
+      "id": 3,
+      "eval_name": "step0-backend-tidak-disebut",
+      "prompt": "Buatkan project fullstack baru namanya 'toko-online', frontend sama backend sekalian. Setup struktur lengkapnya ya.",
+      "expected_output": "Claude WAJIB bertanya dulu backend mana yang dipakai (go / nestjs / express) sebelum menulis file apa pun.",
+      "files": [],
+      "assertions": [
+        "Claude mengajukan pertanyaan klarifikasi tentang pilihan backend sebelum melakukan pekerjaan lain",
+        "Pertanyaan menyebutkan ketiga opsi terkunci: Go, NestJS, dan Express/Node",
+        "TIDAK ada file atau direktori project yang dibuat sebelum user menjawab",
+        "Claude TIDAK menanyakan pilihan frontend (frontend sudah terkunci React 19 + Tailwind 4)"
+      ]
+    },
+    {
+      "id": 4,
+      "eval_name": "scaffold-build-regression",
+      "prompt": "Jalankan scaffolder skill ini untuk backend go, nestjs, dan express (nama boleh bebas), lalu untuk setiap hasilnya jalankan npm install dan build (build:web, dan build:api untuk stack Node). Laporkan hasilnya.",
+      "expected_output": "Untuk ketiga stack, scaffold berhasil, npm install keluar dengan status 0, dan build:web serta build:api (Node) sukses tanpa error. Ini mengunci baseline \"proyek hasil scaffold harus hidup\" sebagai regression test.",
+      "files": [],
+      "assertions": [
+        "Scaffold berhasil untuk go, nestjs, dan express tanpa error",
+        "npm install keluar dengan status 0 untuk ketiga stack",
+        "npm run build:web sukses untuk ketiga stack",
+        "npm run build:api sukses untuk nestjs dan express",
+        "Tidak ada langkah yang dilewati secara diam-diam tanpa dilaporkan"
+      ]
+    },
+    {
+      "id": 5,
+      "eval_name": "go-monorepo-deploy",
+      "prompt": "Buatkan monorepo baru 'stokgudang' backend Go + React, nanti dideploy ke server saya (ssh host 'vps-acme', tanpa playbook). Port yang kosong 8085, repo GitHub acme/stokgudang, domain stokgudang.example.com. Siapkan juga file deploy-nya. Jangan jalankan npm install / go mod download dan jangan ubah apa pun di server.",
+      "expected_output": "A Go monorepo scaffolded with --slug stokgudang --port 8085 --ghcr-owner acme --domain stokgudang.example.com --ssh-host vps-acme, whose deploy setup follows references/docker-deployment.md: image built in CI and pushed to GHCR, image-only prod compose on 127.0.0.1:8085, host MySQL with stokgudang_db/stokgudang_user, host nginx site, no server changes.",
+      "files": [],
+      "assertions": [
+        ".github/workflows/release-image.yml builds linux/amd64 and pushes ghcr.io/<owner>/<repo>:<git-sha> only after the ci workflow succeeds on main",
+        "infra/deploy/docker-compose.prod.yml has no build: key, uses image ghcr.io/acme/stokgudang:${IMAGE_TAG:?...} and publishes only 127.0.0.1:8085:8080",
+        "No database/mysql service exists in any compose file",
+        "infra/deploy/deploy.sh takes a <git-sha>, refuses latest, backs up the DB before migrating, and waits for /readyz",
+        "knowledge/DEPLOYMENT.md names stokgudang_db and stokgudang_user@'172.%' with mysql_native_password",
+        "knowledge/DEPLOYMENT.md names SSH host vps-acme and Server playbook none",
+        "infra/nginx/nginx.conf proxies server_name stokgudang.example.com to 127.0.0.1:8085 and does not use default_server",
+        "Dockerfile runs as non-root, uses ENTRYPOINT (not CMD), and has a HEALTHCHECK on /readyz",
+        "No real .env with secrets is created; only .env.example and infra/deploy/.env.production.example",
+        "Claude did not run any command that changes the server (no DB creation, nginx, certbot, docker login, or deploy)"
+      ]
+    },
+    {
+      "id": 6,
+      "eval_name": "design-research-before-ui",
+      "prompt": "Saya sudah punya monorepo 'klinikgigi' hasil skill ini (NestJS + React). Sekarang buatkan tampilan frontend-nya: halaman publik untuk booking jadwal dokter gigi dan dashboard admin klinik untuk mengelola jadwal & pasien. Target pengguna di Indonesia.",
+      "expected_output": "Before writing any UI code, Claude researches current sources on the internet about how clinic/dental booking sites and clinic admin dashboards are ideally and commonly designed, writes the findings, design direction, anti-patterns, and dated sources into knowledge/DESIGN.md, then builds the screens through the frontend-design skill following that brief.",
+      "files": [],
+      "assertions": [
+        "Claude performed web research (WebSearch/WebFetch or browser) BEFORE writing UI components",
+        "Research covers real products in the clinic/dental booking category, at least one design system or platform guideline, and at least one UX research source",
+        "knowledge/DESIGN.md is filled: status no longer 'NOT RESEARCHED YET', research date set, findings, design direction, anti-patterns, and a Sources list with URLs and access dates",
+        "The brief distinguishes the public booking flow (patients, mostly phone) from the admin dashboard (staff, desktop) in devices and layout",
+        "Locale is handled for Indonesia (id-ID dates, Indonesian copy)",
+        "No competitor branding, logos, or copy were copied into the project",
+        "UI implementation follows the brief and uses the frontend-design skill; theme values live in apps/web/src/theme/"
+      ]
+    },
+    {
+      "id": 7,
+      "eval_name": "go-assemble-from-library",
+      "prompt": "Buatkan project back-office gudang bernama \"stok-gudang\": backend Go, frontend React. Staff harus login dengan email dan password, admin bisa kelola akun staff, lalu ada modul produk dan stok. Pakai modul dari library yang sudah ada kalau cocok. Jangan deploy.",
+      "expected_output": "Scaffolds a Go project, reads the module library catalog, presents one install/adapt/build table for confirmation (auth + users + app-shell + ui-core installed, products/stock built), installs with module.mjs in dependency order with UserStore wired to users, and builds products/stock as custom modules that import no other module.",
+      "files": [],
+      "assertions": [
+        "Reads the library CATALOG.md (or module.mjs list) before writing feature code",
+        "Shows one capability table (install / install + adapt / build) and asks for confirmation once before installing",
+        "Installs with module.mjs add (not by copying files): ui-core and app-shell before users, users before auth",
+        "Wires auth with --port UserStore=users",
+        "modules.lock.json exists after installing",
+        "Products and stock are built as new modules following the standard (ports/ for what they need, registered in registry.go and app/modules.ts)",
+        "No module imports another module (only the composition root does, through adapters)",
+        "Protected routes in custom modules use d.Auth.Require rather than importing auth"
+      ]
+    },
+    {
+      "id": 8,
+      "eval_name": "deploy-target-not-configured",
+      "prompt": "Buatkan monorepo baru 'kasirku' backend Go + React dan siapkan deploy-nya ke server.",
+      "expected_output": "Before writing deploy facts, Claude looks for knowledge/DEPLOYMENT.md and ~/.config/rudis-monorepo/targets.json; finding neither, it asks the user for the SSH host alias, whether the server keeps a playbook / app registry, the registry owner, and the domain, offers to save the answers to targets.json, and does not guess any of them.",
+      "files": [],
+      "assertions": [
+        "Claude asks for the SSH host alias, playbook (or none), registry owner, and domain before scaffolding with deploy flags",
+        "Claude offers to save the answers to ~/.config/rudis-monorepo/targets.json and writes it only after a yes",
+        "No port, SSH host, owner, or domain is invented; an unknown value is left as a __PLACEHOLDER__ marker",
+        "No server name from outside the conversation (e.g. a previous project's host) appears in the generated files",
+        "Claude did not run any command that changes the server"
+      ]
+    }
+  ]
+}

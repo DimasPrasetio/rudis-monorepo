@@ -1,0 +1,211 @@
+package kernel
+
+import (
+	"context"
+	"database/sql"
+	"database/sql/driver"
+	"errors"
+	"log/slog"
+	"math/rand/v2"
+	"sync"
+	"time"
+
+	"github.com/go-sql-driver/mysql"
+
+	"__GO_MODULE__/internal/database"
+)
+
+// DBTX is what sqlc's generated Queries accept: the pool or a transaction.
+type DBTX interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	PrepareContext(ctx context.Context, query string) (*sql.Stmt, error)
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+// TxSlot is the shared transaction every module reaches through Deps.Tx — the one way to make
+// changes in several modules commit or roll back together. The transaction travels in the
+// context: a port called with that ctx works inside it, so modules never pass *sql.Tx around.
+//
+// Inside fn: no calls to the outside world (email, payment, tax APIs). A retry runs fn again
+// and a rollback cannot take them back — enqueue a task (d.Tasks) instead; it exists only if
+// the transaction commits.
+type TxSlot struct {
+	db          *sql.DB // nil in tests: fn runs without a transaction
+	log         *slog.Logger
+	maxAttempts int
+}
+
+// NewTxSlot returns the slot over db.
+func NewTxSlot(db *sql.DB, log *slog.Logger) *TxSlot {
+	return &TxSlot{db: db, log: log, maxAttempts: 4}
+}
+
+type txState struct {
+	tx    *sql.Tx
+	mu    sync.Mutex
+	hooks []func(context.Context)
+	// fatal is the first error after which the transaction is gone on the server (a deadlock,
+	// a broken connection). MySQL then runs every later statement on the session in autocommit,
+	// so they are refused and the transaction fails — even if the code that saw the error went
+	// on. The database driver reports every statement's error here (database.Watcher), also one
+	// surfacing in QueryRow's Scan or while rows are read.
+	fatal error
+	// noRetry is set by any Do in the transaction that must not run twice.
+	noRetry bool
+}
+
+// Before refuses a statement once the transaction is gone (database.Watcher).
+func (st *txState) Before() error { return st.failed() }
+
+// After records err when it ends the transaction on the server (database.Watcher).
+func (st *txState) After(err error) {
+	if err == nil || !(database.Retryable(err) || errors.Is(err, driver.ErrBadConn) || errors.Is(err, mysql.ErrInvalidConn)) {
+		return
+	}
+	st.mu.Lock()
+	if st.fatal == nil {
+		st.fatal = err
+	}
+	st.mu.Unlock()
+}
+
+func (st *txState) failed() error {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.fatal
+}
+
+type txKey struct{}
+
+func txFrom(ctx context.Context) *txState {
+	st, _ := ctx.Value(txKey{}).(*txState)
+	return st
+}
+
+// TxOption adjusts one Do.
+type TxOption func(*txOptions)
+
+type txOptions struct {
+	isolation sql.IsolationLevel
+	noRetry   bool
+}
+
+// ReadCommitted runs the transaction at READ COMMITTED — for paths heavy with locking reads.
+func ReadCommitted() TxOption { return func(o *txOptions) { o.isolation = sql.LevelReadCommitted } }
+
+// NoRetry never runs fn twice, even after a deadlock — when fn cannot safely repeat.
+func NoRetry() TxOption { return func(o *txOptions) { o.noRetry = true } }
+
+// Do runs fn in a transaction carried by the ctx it receives. Inside another Do it joins that
+// transaction (no savepoint) and returns fn's error to it; only the outermost Do commits,
+// retries after a deadlock or lock wait timeout (running fn again from the start), and runs the
+// AfterCommit hooks. A panic rolls back and is re-raised.
+func (t *TxSlot) Do(ctx context.Context, fn func(ctx context.Context) error, opts ...TxOption) error {
+	var o txOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
+	if st := txFrom(ctx); st != nil {
+		if o.noRetry {
+			st.mu.Lock()
+			st.noRetry = true // the outermost Do must not run this one twice
+			st.mu.Unlock()
+		}
+		return fn(ctx)
+	}
+	for attempt := 1; ; attempt++ {
+		noRetry, err := t.once(ctx, fn, o)
+		if err == nil || o.noRetry || noRetry || attempt >= t.maxAttempts || !database.Retryable(err) || ctx.Err() != nil {
+			return err
+		}
+		wait := time.Duration(rand.Int64N(int64(25*time.Millisecond) << attempt))
+		t.log.Warn("tx: retrying after a lock conflict", "attempt", attempt, "err", err)
+		select {
+		case <-time.After(wait):
+		case <-ctx.Done():
+			return err
+		}
+	}
+}
+
+func (t *TxSlot) once(ctx context.Context, fn func(ctx context.Context) error, o txOptions) (noRetry bool, err error) {
+	st := &txState{}
+	if t.db == nil {
+		if err := fn(context.WithValue(ctx, txKey{}, st)); err != nil {
+			return st.noRetry, err
+		}
+		st.run(ctx)
+		return false, nil
+	}
+	tx, err := t.db.BeginTx(ctx, &sql.TxOptions{Isolation: o.isolation})
+	if err != nil {
+		return false, err
+	}
+	st.tx = tx
+	defer func() {
+		if p := recover(); p != nil {
+			_ = tx.Rollback()
+			panic(p)
+		}
+	}()
+	err = fn(database.WithWatcher(context.WithValue(ctx, txKey{}, st), st))
+	// A statement that ended the transaction on the server fails it with that error — even when
+	// fn went on, or returned another one — so a deadlock is still retried.
+	if fatal := st.failed(); fatal != nil {
+		err = fatal
+	}
+	// A failed fn rolls the whole transaction back — after a lock wait timeout MySQL undid only
+	// the statement, and the rest must not be committed later or retried on top of.
+	if err != nil {
+		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
+			t.log.Warn("tx: rollback failed", "err", rbErr)
+		}
+		return st.noRetry, err
+	}
+	if err := tx.Commit(); err != nil {
+		return st.noRetry, err
+	}
+	st.run(ctx)
+	return false, nil
+}
+
+// run calls the hooks once the transaction committed, with the caller's ctx (no transaction).
+func (st *txState) run(ctx context.Context) {
+	st.mu.Lock()
+	hooks := st.hooks
+	st.hooks = nil
+	st.mu.Unlock()
+	for _, h := range hooks {
+		h(ctx)
+	}
+}
+
+// Conn is the transaction ctx carries, or the pool when it carries none. A repository calls it
+// for every operation — queries.New(d.Tx.Conn(ctx)) — so it works inside or outside a Do.
+func (t *TxSlot) Conn(ctx context.Context) DBTX {
+	if st := txFrom(ctx); st != nil && st.tx != nil {
+		return st.tx
+	}
+	if t.db == nil {
+		return nil
+	}
+	return t.db
+}
+
+// AfterCommit runs fn once the outermost transaction commits; it is dropped when that
+// transaction rolls back or is retried. Outside a transaction fn runs at once. Best effort —
+// never the only record of work that must happen (that is d.Tasks).
+func (t *TxSlot) AfterCommit(ctx context.Context, fn func(ctx context.Context)) {
+	st := txFrom(ctx)
+	if st == nil {
+		fn(ctx)
+		return
+	}
+	st.mu.Lock()
+	st.hooks = append(st.hooks, fn)
+	st.mu.Unlock()
+}
+
+// InTx reports whether ctx carries a transaction.
+func (t *TxSlot) InTx(ctx context.Context) bool { return txFrom(ctx) != nil }

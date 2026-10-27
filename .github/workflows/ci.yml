@@ -1,0 +1,54 @@
+name: rudis-monorepo
+
+# Keeps the skill's architecture locked: references, scaffolder, module contract, and the
+# shipped package must agree (rules: AGENTS.md).
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the kernel release tags
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node scripts/check-drift.mjs
+      - run: node scripts/package.mjs --check
+      # Every change to what a project or the references contain is a tagged kernel release —
+      # what the module library pins (the post-commit hook tags; push with --follow-tags).
+      - if: github.event_name == 'push'
+        run: node scripts/kernel-tag.mjs --check
+
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1"
+          --health-interval=5s --health-timeout=5s --health-retries=20
+    env:
+      SMOKE_DB_DSN: "root:@tcp(127.0.0.1:3306)/"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27"
+      - name: sqlc
+        run: go install github.com/sqlc-dev/sqlc/cmd/sqlc@v1.31.1 && echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - run: node scripts/smoke-test.mjs

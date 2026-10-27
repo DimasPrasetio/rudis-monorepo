@@ -1,0 +1,59 @@
+// Package validator collects input errors field by field, so a client sees every problem
+// in one response instead of one per attempt.
+package validator
+
+import (
+	"net/mail"
+	"strings"
+	"unicode/utf8"
+
+	"__GO_MODULE__/internal/shared/apperror"
+)
+
+// FieldError is one entry of the envelope's "errors".
+type FieldError struct {
+	Field   string `json:"field"`
+	Message string `json:"message"`
+}
+
+// Validator accumulates errors. The zero value is ready to use.
+type Validator struct {
+	errs []FieldError
+}
+
+// Check records message for field when ok is false.
+func (v *Validator) Check(ok bool, field, message string) {
+	if !ok {
+		v.errs = append(v.errs, FieldError{Field: field, Message: message})
+	}
+}
+
+// Required checks that value is not blank.
+func (v *Validator) Required(field, value string) {
+	v.Check(strings.TrimSpace(value) != "", field, "wajib diisi")
+}
+
+// MaxLen checks that value has at most n characters.
+func (v *Validator) MaxLen(field, value string, n int) {
+	v.Check(utf8.RuneCountInString(value) <= n, field, "terlalu panjang")
+}
+
+// Email checks that a non-empty value is a single plain address.
+func (v *Validator) Email(field, value string) {
+	if value == "" {
+		return
+	}
+	a, err := mail.ParseAddress(value)
+	v.Check(err == nil && a.Address == value, field, "harus berupa alamat email yang valid")
+}
+
+// Valid reports whether nothing was recorded.
+func (v *Validator) Valid() bool { return len(v.errs) == 0 }
+
+// Err returns nil, or a 422 *apperror.Error listing every recorded field error.
+func (v *Validator) Err() error {
+	if v.Valid() {
+		return nil
+	}
+	return apperror.Validation(v.errs)
+}

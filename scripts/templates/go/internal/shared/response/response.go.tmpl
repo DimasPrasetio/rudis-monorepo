@@ -1,0 +1,68 @@
+// Package response writes the API envelope (.claude/rules/api-standard.md). Handlers never
+// write JSON by hand.
+package response
+
+import (
+	"encoding/json"
+	"net/http"
+
+	"__GO_MODULE__/internal/shared/apperror"
+	"__GO_MODULE__/internal/shared/logger"
+	"__GO_MODULE__/internal/shared/pagination"
+)
+
+type success struct {
+	Success bool             `json:"success"`
+	Message string           `json:"message"`
+	Data    any              `json:"data"`
+	Meta    *pagination.Meta `json:"meta,omitempty"`
+}
+
+type failure struct {
+	Success bool   `json:"success"`
+	Message string `json:"message"`
+	Errors  any    `json:"errors"`
+}
+
+// JSON writes v with status. Prefer the envelope helpers below.
+func JSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+// OK writes a 200 success envelope.
+func OK(w http.ResponseWriter, message string, data any) {
+	JSON(w, http.StatusOK, success{Success: true, Message: message, Data: data})
+}
+
+// Created writes a 201 success envelope.
+func Created(w http.ResponseWriter, message string, data any) {
+	JSON(w, http.StatusCreated, success{Success: true, Message: message, Data: data})
+}
+
+// Paginated writes a 200 success envelope with meta.
+func Paginated(w http.ResponseWriter, message string, data any, meta pagination.Meta) {
+	JSON(w, http.StatusOK, success{Success: true, Message: message, Data: data, Meta: &meta})
+}
+
+// Fail writes an error envelope. A nil errs is sent as [].
+func Fail(w http.ResponseWriter, status int, message string, errs any) {
+	if errs == nil {
+		errs = []any{}
+	}
+	JSON(w, status, failure{Success: false, Message: message, Errors: errs})
+}
+
+// Error writes err as an error envelope. An *apperror.Error keeps its status, message and
+// details; anything else is logged and answered with a generic 500.
+func Error(w http.ResponseWriter, r *http.Request, err error) {
+	e, ok := apperror.As(err)
+	if !ok {
+		e = apperror.Internal(err)
+	}
+	if e.Status >= http.StatusInternalServerError {
+		logger.From(r.Context()).Error("request failed", "err", err)
+	}
+	Fail(w, e.Status, e.Message, e.Details)
+}
