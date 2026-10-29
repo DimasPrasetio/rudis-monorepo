@@ -254,7 +254,10 @@ surface every module — hand-written or from the module library — is built ag
   default: `ScopeFrom` on a ctx without a scope panics (a failed task, a 500) rather than file
   data under the wrong company — background work over company data loops
   `d.Scope.Companies(ctx)` with `kernel.WithScope`, a public route picks its company itself, and
-  `kernel.HasScope(ctx)` tells whether ctx carries one. `d.Authz.Units(ctx,
+  `kernel.HasScope(ctx)` tells whether ctx carries one. Work that may run at installation level
+  (an outbox worker, a reset-by-token email) asks `kernel.CompanyOf(ctx)` instead of
+  `ScopeFrom`: the company, or `(0, false)` where `ScopeFrom` would panic; `d.Scope.Several()`
+  says whether the app has several companies. `d.Authz.Units(ctx,
   permission)` says which branches a permission reaches (a provider implementing
   `kernel.ScopedAuthorizer` answers per branch; otherwise the whole company when `Can`). Tasks
   and events carry the scope; `d.Scope.Companies(ctx)` lists companies for per-company jobs. A
@@ -346,6 +349,7 @@ one (its `kernel/`) and its module developers build on that alone.
 | 4 | security and safety: `DecodeJSON` JSON-only (415) with safe messages; cross-site writes refused; `request.ClientIP` + `TRUSTED_PROXIES`; `Authorizer.Covers` / `d.Authz.Covers`; duplicate permission names and production-without-provider refused; explicit `APP_ENV`; UTC DB sessions; 25 s shutdown; tests for these in `server/` and `shared/request/`; web: route error and 404 pages, `http-client` sends cookies to a separate API origin |
 | 5 | `Deps.Jobs` (`jobs.go`), `Deps.Audit` (`audit.go`), `request.RequestID` / `ClientIPFrom` / `AllowTransfer`, `Config.DataDir` and the `./data:/app/data` volume (compose, Dockerfile, deploy.sh), tests for jobs and audit; web: open slot names, the `profile:changed` app event |
 | 6 | `Deps.Tx` (`tx.go`), `Deps.Tasks` (`tasks.go`), `Deps.Events` (`events.go`), calendar schedules (`calendar.go`), `Deps.Clock` (`clock.go`) and `APP_TIMEZONE`, `Deps.Scope` (`scope.go`; `Authz.Units`, `ScopedAuthorizer`, scope resolved in `Auth.Require`), `AuditEntry.Kind` and the record's scope, `Deps.HTTP` (`http.go`), `kernel.NewDeps`, `database.OpenWith` / `Retryable`, `request.AllowStream`, the `kerneltest` package, MySQL tests (`kernel_mysql_test.go`, run with `KERNEL_TEST_DSN`), the kernel's tables (migration `<ts>_kernel_6`), `time/tzdata`; deploy: the nginx stream location, `APP_TIMEZONE` in the env examples, the kernel tests in CI; web: `shared/scope.ts` (`X-Scope`), the `scope:changed` app event, the `shell:scope` slot. `NewJobsSlot` and `NewAuditSlot` take a clock — built by `kernel.NewDeps` |
+| 7 | `kernel.CompanyOf` and `ScopeSlot.Several` (`scope.go`): a module asks for the company of a ctx, or learns it runs at installation level, without recovering from `ScopeFrom`'s panic; web: `Button` and `FIELD` draw keyboard focus as a solid `--ring` edge (outline; border + 1px ring) instead of a translucent ring — WCAG 2.2 · 1.4.11 |
 
 A project scaffolded on an older kernel moves up by copying the new kernel files from this
 skill's `scripts/templates/` (for 2: `internal/kernel/authz.go`, the `Authz` field in `Deps`,
@@ -368,7 +372,9 @@ backed up; for 6: every file in `internal/kernel/` (with `kerneltest/`), `intern
 `infra/nginx/nginx.conf` (then reload nginx on the server); the kernel-test step in
 `.github/workflows/ci.yml`; and the web files `shared/scope.ts`, `shared/app-events.ts`,
 `shared/composition.tsx`, `shared/services/http-client.ts`. Library modules for kernel 6 are
-then upgraded with `module.mjs upgrade`), then raising both version numbers.
+then upgraded with `module.mjs upgrade`; for 7: `internal/kernel/scope.go`, and the web files
+`shared/components/primitives/button.tsx` and `shared/lib/field-classes.ts`), then raising both
+version numbers.
 
 ## Module contract and the registry
 

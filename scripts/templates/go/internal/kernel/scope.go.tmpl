@@ -34,7 +34,8 @@ var severalCompanies atomic.Bool
 // with none — a calendar job, a public route, a task enqueued by either — falls to the default
 // company in an app with one company; with a scope resolver (several companies) it panics
 // rather than file data under the wrong one: background work over company data loops
-// d.Scope.Companies with WithScope, and HasScope tells whether ctx carries one.
+// d.Scope.Companies with WithScope, HasScope tells whether ctx carries one, and CompanyOf asks
+// for the company without panicking.
 func ScopeFrom(ctx context.Context) Scope {
 	if s, ok := ctx.Value(scopeKey{}).(Scope); ok && s.CompanyID > 0 {
 		return s
@@ -49,6 +50,19 @@ func ScopeFrom(ctx context.Context) Scope {
 func HasScope(ctx context.Context) bool {
 	s, ok := ctx.Value(scopeKey{}).(Scope)
 	return ok && s.CompanyID > 0
+}
+
+// CompanyOf is the company ctx works in, as ScopeFrom decides it, without panicking: work with
+// no scope in an app with several companies gets (0, false) — installation level, such as an
+// outbox worker or a reset-by-token email — where ScopeFrom would panic.
+func CompanyOf(ctx context.Context) (int64, bool) {
+	if s, ok := ctx.Value(scopeKey{}).(Scope); ok && s.CompanyID > 0 {
+		return s.CompanyID, true
+	}
+	if severalCompanies.Load() {
+		return 0, false
+	}
+	return DefaultCompany, true
 }
 
 // ErrScopeDenied is what a resolver returns for a scope the user is not placed in.
@@ -79,6 +93,12 @@ func (s *ScopeSlot) Provide(r ScopeResolver) {
 	defer s.mu.Unlock()
 	s.r = r
 	severalCompanies.Store(r != nil)
+}
+
+// Several reports whether the app has several companies: true once a scope resolver is
+// provided. Then a ctx without a scope means installation level, not the default company.
+func (s *ScopeSlot) Several() bool {
+	return s.resolver() != nil
 }
 
 func (s *ScopeSlot) resolver() ScopeResolver {

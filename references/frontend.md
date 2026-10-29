@@ -79,6 +79,10 @@ built on it — a project on another foundation could not install them.
   field, select trigger, and textarea shares one look through `FIELD` in
   `shared/lib/field-classes.ts` — use it for any new field-like control instead of restating
   the classes.
+- Keyboard focus is solid `--ring`: `Button` draws a 2px outline 2px out, `FIELD` turns its
+  border `--ring` and adds a 1px `--ring` ring (`--destructive` when `aria-invalid`), and every
+  other element gets the 2px outline from `theme.css`. A preset keeps `--ring` at 3:1 or more
+  against `--card` and `--background` (WCAG 2.2 · 1.4.11); never a translucent `ring-ring/50`.
 
 ### UI kits: check them before writing a component
 

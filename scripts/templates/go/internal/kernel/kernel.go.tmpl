@@ -36,7 +36,10 @@ import (
 //	   AuditEntry.Kind and the record's scope, request.AllowStream (SSE), Deps.HTTP and
 //	   database.OpenWith (kit seams), the kerneltest package;
 //	   web: shared/scope.ts (X-Scope header), the "shell:scope" slot, the "scope:changed" event
-const Version = 6
+//	7  kernel.CompanyOf (the company of a ctx, or "installation level", without panicking) and
+//	   d.Scope.Several (one company or several); web: Button and FIELD draw keyboard focus as a
+//	   solid --ring edge (WCAG 2.2 · 1.4.11)
+const Version = 7
 
 // Deps is what a module's New receives. A module keeps what it needs from it and never
 // reaches for globals instead.

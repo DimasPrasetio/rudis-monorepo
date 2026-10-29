@@ -106,3 +106,21 @@ func TestWithSeveralCompaniesThereIsNoDefault(t *testing.T) {
 	}()
 	ScopeFrom(context.Background())
 }
+
+func TestCompanyOfNeverPanics(t *testing.T) {
+	scope := &ScopeSlot{}
+	if c, ok := CompanyOf(context.Background()); scope.Several() || !ok || c != DefaultCompany {
+		t.Fatalf("one company: several=%v, CompanyOf = %d %v", scope.Several(), c, ok)
+	}
+	scope.Provide(branches{})
+	t.Cleanup(func() { scope.Provide(nil) })
+	if !scope.Several() {
+		t.Fatal("a resolver is provided but Several is false")
+	}
+	if c, ok := CompanyOf(context.Background()); ok || c != 0 {
+		t.Fatalf("several companies, no scope: CompanyOf = %d %v, want 0 false", c, ok)
+	}
+	if c, ok := CompanyOf(WithScope(context.Background(), Scope{CompanyID: 2})); !ok || c != 2 {
+		t.Fatalf("several companies, scope 2: CompanyOf = %d %v", c, ok)
+	}
+}
