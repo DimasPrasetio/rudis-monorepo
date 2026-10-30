@@ -99,7 +99,7 @@
         "infra/deploy/docker-compose.prod.yml has no build: key, uses image ghcr.io/acme/stokgudang:${IMAGE_TAG:?...} and publishes only 127.0.0.1:8085:8080",
         "No database/mysql service exists in any compose file",
         "infra/deploy/deploy.sh takes a <git-sha>, refuses latest, backs up the DB before migrating, and waits for /readyz",
-        "knowledge/DEPLOYMENT.md names stokgudang_db and stokgudang_user@'172.%' with mysql_native_password",
+        "knowledge/DEPLOYMENT.md names stokgudang_db and stokgudang_user@'172.%', reads SELECT VERSION() first, and creates the user WITH caching_sha2_password (never mysql_native_password for a new account)",
         "knowledge/DEPLOYMENT.md names SSH host vps-acme and Server playbook none",
         "infra/nginx/nginx.conf proxies server_name stokgudang.example.com to 127.0.0.1:8085 and does not use default_server",
         "Dockerfile runs as non-root, uses ENTRYPOINT (not CMD), and has a HEALTHCHECK on /readyz",

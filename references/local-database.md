@@ -65,9 +65,9 @@ string the moment `.env.example` is copied: tools then sign in to whatever MySQL
 | MariaDB | `IDENTIFIED BY` | MariaDB has no `caching_sha2_password` |
 | MySQL 5.7 | `IDENTIFIED BY` | end of life — upgrade |
 
-The Go driver needs no TLS for `caching_sha2_password`: on a full authentication over plain
-TCP it asks the server for its RSA public key itself and sends the password encrypted with it
-(go-sql-driver/mysql, `auth.go`).
+The scaffold's drivers need no TLS for `caching_sha2_password`: on a full authentication over
+plain TCP they ask the server for its RSA public key themselves — which drivers do, which need
+an option, and which cannot: [docker-deployment.md › Drivers on the docker bridge](docker-deployment.md#drivers-on-the-docker-bridge-without-tls).
 
 ### `Error 1524: Plugin 'mysql_native_password' is not loaded`
 
@@ -97,8 +97,7 @@ Sources: [MySQL 8.4 manual — Native Pluggable Authentication](https://dev.mysq
 [MySQL Bug #114876](https://bugs.mysql.com/bug.php?id=114876) (1524 for a non-existent user on 8.4.0) ·
 `decoy_user` in `sql_authentication.cc`: [tag mysql-8.4.0](https://github.com/mysql/mysql-server/blob/mysql-8.4.0/sql/auth/sql_authentication.cc)
 (`random_number % PLUGIN_LAST` — every built-in plugin) and [branch 8.4](https://github.com/mysql/mysql-server/blob/8.4/sql/auth/sql_authentication.cc)
-(`% enabled_plugins.size()`) · [go-sql-driver/mysql `auth.go`](https://github.com/go-sql-driver/mysql/blob/v1.8.1/auth.go)
-(public key requested for `caching_sha2_password` without TLS).
+(`% enabled_plugins.size()`).
 
 ## Scripts that rebuild a database
 

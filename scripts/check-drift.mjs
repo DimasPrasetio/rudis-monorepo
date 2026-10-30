@@ -379,7 +379,11 @@ for (const backend of ["go", "nestjs", "express"]) {
     need(release.includes("workflows: [ci]") && release.includes("linux/amd64") && release.includes("head_sha"), "release-image must build linux/amd64 from the green ci head_sha");
     need(read(".github/workflows/ci.yml").startsWith("name: ci\n"), "ci workflow must be named ci (release-image depends on it)");
     need(read(".dockerignore").split("\n").includes(".env"), ".dockerignore must exclude .env");
-    need(read("knowledge/DEPLOYMENT.md").includes("| SSH host | `drift-host`") && release.includes("ssh drift-host "), "DEPLOYMENT.md and the release summary must name the configured SSH host");
+    const deployment = read("knowledge/DEPLOYMENT.md");
+    need(deployment.includes("| SSH host | `drift-host`") && release.includes("ssh drift-host "), "DEPLOYMENT.md and the release summary must name the configured SSH host");
+    const version = deployment.indexOf("SELECT VERSION();");
+    need(version !== -1 && version < deployment.indexOf("CREATE USER"), "DEPLOYMENT.md must read SELECT VERSION() before CREATE USER");
+    need(/CREATE USER [^\n]* IDENTIFIED WITH caching_sha2_password/.test(deployment) && !/CREATE USER [^\n]*mysql_native_password/.test(deployment), "DEPLOYMENT.md must create new accounts WITH caching_sha2_password, never mysql_native_password");
 
     // Without flags the markers must be there, and deploy.sh must refuse them.
     const bare = scaffoldOnce(backend);

@@ -241,18 +241,146 @@ DATABASE_URL=mysql://<slug>_user:<password>@host.docker.internal:3306/<slug>_db
 - The host MySQL must log row-based (`binlog_format=ROW`, MySQL 8's default): the kernel's task
   queue claims rows with `SKIP LOCKED`, which statement-based replication cannot replay safely.
 
-Database + user, created once on the host MySQL:
+Database + user, created once on the host MySQL. Read the version first — it decides the
+account plugin, by the same table as on a developer's machine
+([local-database.md › The account plugin](local-database.md#the-account-plugin-read-the-version-first)):
+
+```bash
+sudo mysql -e 'SELECT VERSION();'
+```
+
+On MySQL 8.0, 8.4 or 9.x (MariaDB: `IDENTIFIED BY '<random-hex>'`):
 
 ```sql
 CREATE DATABASE <slug>_db CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-CREATE USER '<slug>_user'@'172.%' IDENTIFIED WITH mysql_native_password BY '<random-hex>';
+CREATE USER '<slug>_user'@'172.%' IDENTIFIED WITH caching_sha2_password BY '<random-hex>';
 GRANT ALL PRIVILEGES ON <slug>_db.* TO '<slug>_user'@'172.%';
 FLUSH PRIVILEGES;
 ```
 
-`'172.%'` because connections arrive from the docker bridge; `mysql_native_password` because the
-app connects over that internal bridge without TLS, which MySQL 8's default
-`caching_sha2_password` rejects on first auth (`ERROR 2061`).
+`'172.%'` because connections arrive from the docker bridge. `caching_sha2_password` because an
+account created `WITH mysql_native_password` stops the app the day the server moves to 8.4
+(`Error 1524` — why, in the same table).
+
+### Drivers on the docker bridge, without TLS
+
+The app reaches MySQL over plain TCP. `caching_sha2_password` then needs, on a *full*
+authentication — the first login, and the first after every server restart or `FLUSH
+PRIVILEGES` (the cache is in memory) — either TLS or the server's RSA public key. The server
+has a key pair by default (`caching_sha2_password_auto_generate_rsa_keys=ON`) but sends the
+key only when the client asks. The scaffold's clients ask by themselves; none needs a DSN
+option, and none turns TLS on unless told to:
+
+| Backend | Client | On full authentication without TLS |
+|---|---|---|
+| Go app | go-sql-driver/mysql v1.8.1 | requests the key, sends the password RSA-encrypted (`auth.go`) |
+| Go migrate (`migrate/migrate:v4.18.1`) | go-sql-driver/mysql v1.5.0 (its `go.mod`) | same |
+| NestJS (and `prisma migrate deploy`) | Prisma 5 → quaint → mysql_async | same (`continue_caching_sha2_password_auth`) |
+| Express, if it uses `mysql2` (or Knex/Drizzle on it) | mysql2 ≥ 2.0 | same |
+
+Where it does **not** work as is:
+
+- **`mysql` (mysqljs)**: no `caching_sha2_password` support at all — an Express app must not
+  use it (nor Knex `client: 'mysql'`); use `mysql2`.
+- **`mariadb` (Node connector)**, and so **Prisma 6/7 with `@prisma/adapter-mariadb`**: refuses
+  with `ER_CANNOT_RETRIEVE_RSA_KEY` unless given `allowPublicKeyRetrieval: true` (or
+  `?allowPublicKeyRetrieval=true` in the URL), or `cachingRsaPublicKey`, or TLS. Set it when a
+  project moves to that driver.
+
+`ERROR 2061 … Authentication requires secure connection` is the message of libmysqlclient
+tools — the `mysql` CLI, `mysqldump` — when TLS is off (`--ssl-mode=DISABLED`, or a server
+without SSL) and neither `--get-server-public-key` nor `--server-public-key-path` is given. It
+never comes from the app's drivers. To test the account from a container with the CLI, add
+`--get-server-public-key`. A test that follows an earlier successful login passes through the
+cache and proves nothing about the RSA path — test right after creating the account.
+
+A key fetched on the fly protects the password from a passive listener, not from someone who
+can rewrite traffic; on the bridge inside one host that is the accepted trade-off. Across a
+network, use TLS.
+
+### Accounts created with `mysql_native_password`
+
+Apps set up before this rule have `<slug>_user` `IDENTIFIED WITH mysql_native_password`:
+
+```bash
+sudo mysql -e "SELECT user, host, plugin FROM mysql.user WHERE plugin = 'mysql_native_password';"
+```
+
+- **On MySQL 8.0 leave them alone.** The plugin still works there; changing a running app's
+  account buys nothing until the server moves.
+- **Before the server moves to 8.4 or 9.x**, switch each one while it is still on 8.0 — the
+  owner's go-ahead first, one app at a time, keeping the password the app already connects
+  with, so `.env` does not change. In the app's folder on the server (the subshell stops at
+  the first step that fails):
+  ```bash
+  cd ~/<slug> && (
+    set -eu
+    C="docker compose -f docker-compose.prod.yml"
+    # The password inside the DSN the app reads — not DB_PASSWORD, which nothing reads — and a
+    # read-only command that signs in the way the app does, picked by backend:
+    if grep -q '^DB_DSN=' .env; then                                        # Go
+      PW=$(sed -n 's/^DB_DSN=[^:]*:\([^@]*\)@.*/\1/p' .env | tr -d '\r"')
+      CHECK="$C --profile ops run --rm migrate version"
+    else                                                                    # NestJS / Express
+      PW=$(sed -n 's|^DATABASE_URL="\{0,1\}mysql://[^:]*:\([^@]*\)@.*|\1|p' .env | tr -d '\r"')
+      CHECK=""
+      grep -q prisma docker-compose.prod.yml && CHECK="$C --profile ops run --rm --entrypoint node migrate node_modules/prisma/build/index.js migrate status --schema apps/api/prisma/schema.prisma"
+    fi
+    [ -n "$PW" ] || { echo "no password found in .env"; exit 1; }
+    printf "ALTER USER '<slug>_user'@'172.%%' IDENTIFIED WITH caching_sha2_password BY '%s';\n" "$PW" | sudo mysql
+    sudo mysql -N -e "SELECT plugin FROM mysql.user WHERE user = '<slug>_user' AND host = '172.%'"
+    # ALTER USER emptied the account's cache: this is a full authentication, as the app's will be.
+    if [ -n "$CHECK" ]; then $CHECK; else echo "no migrate service: check the app's own queries after the restart"; fi
+    $C restart app
+    for i in $(seq 60); do curl -fsS http://127.0.0.1:<port>/readyz >/dev/null && exit 0; sleep 2; done
+    echo "/readyz did not answer within 120 s"; exit 1
+  )
+  ```
+  `printf` is a shell builtin and `sudo mysql` reads stdin, so the password reaches neither a
+  process list nor the shell history. The migrate step is the real test: only the Go `/readyz`
+  queries the database — NestJS and Express answer it without one until the app wires a check,
+  and Express has no migrate service (use whatever query the app runs). `prisma migrate
+  status` exits 1 while migrations are pending or before the first one exists, so run the block
+  after a completed deploy — and if that is why it stopped, the account is fine: check the app
+  log before any undo. If the
+  server refuses the same password (`password_history`), the block stops before anything
+  changed.
+
+  **Undo** (8.0 still has the plugin) — when a step after the `ALTER USER` failed:
+  ```bash
+  cd ~/<slug> && (
+    set -eu
+    if grep -q '^DB_DSN=' .env; then
+      PW=$(sed -n 's/^DB_DSN=[^:]*:\([^@]*\)@.*/\1/p' .env | tr -d '\r"')
+    else
+      PW=$(sed -n 's|^DATABASE_URL="\{0,1\}mysql://[^:]*:\([^@]*\)@.*|\1|p' .env | tr -d '\r"')
+    fi
+    [ -n "$PW" ] || { echo "no password found in .env"; exit 1; }
+    printf "ALTER USER '<slug>_user'@'172.%%' IDENTIFIED WITH mysql_native_password BY '%s';\n" "$PW" | sudo mysql
+    docker compose -f docker-compose.prod.yml restart app
+  )
+  ```
+  Find out why before trying again. Upgrade the server only when the first query returns no
+  app account.
+- **Already upgraded, app down with `Error 1524`**: run the switch above. `ALTER USER` sets the
+  new plugin and password itself; it does not sign in through the old plugin. On 8.4, starting
+  MySQL with `mysql_native_password=ON` is a stopgap that 9.0 no longer offers
+  ([local-database.md › Error 1524](local-database.md#error-1524-plugin-mysql_native_password-is-not-loaded)).
+
+Sources: [MySQL 8.4 — Caching SHA-2 Pluggable Authentication](https://dev.mysql.com/doc/refman/8.4/en/caching-sha2-pluggable-authentication.html)
+(RSA key exchange without TLS, cache cleared by restart and `FLUSH PRIVILEGES`) ·
+[MySQL 8.4 — Native Pluggable Authentication](https://dev.mysql.com/doc/refman/8.4/en/native-pluggable-authentication.html) ·
+[MySQL 8.4 — connection options](https://dev.mysql.com/doc/refman/8.4/en/connection-options.html)
+(`--get-server-public-key`, `--ssl-mode`) ·
+[MySQL 8.4 — server system variables](https://dev.mysql.com/doc/refman/8.4/en/server-system-variables.html)
+(`caching_sha2_password_auto_generate_rsa_keys`, default `ON`) ·
+[go-sql-driver/mysql v1.8.1 `auth.go`](https://github.com/go-sql-driver/mysql/blob/v1.8.1/auth.go) ·
+[golang-migrate v4.18.1 `go.mod`](https://github.com/golang-migrate/migrate/blob/v4.18.1/go.mod) ·
+[go-sql-driver/mysql v1.5.0 `auth.go`](https://github.com/go-sql-driver/mysql/blob/v1.5.0/auth.go) ·
+[prisma/mysql_async `conn/mod.rs` as used by Prisma 5.22](https://github.com/prisma/mysql_async/blob/0d40d0d2c332fc97512bff81e82e62002f03c224/src/conn/mod.rs) ·
+[node-mysql2 `caching_sha2_password.js`](https://github.com/sidorares/node-mysql2/blob/v3.11.0/lib/auth_plugins/caching_sha2_password.js) ·
+[mysqljs/mysql #2002](https://github.com/mysqljs/mysql/issues/2002) ·
+[mariadb-connector-nodejs 3.5.4 `caching-sha2-password-auth.js`](https://github.com/mariadb-corporation/mariadb-connector-nodejs/blob/3.5.4/lib/cmd/handshake/auth/caching-sha2-password-auth.js).
 
 ## CI → GHCR
 
@@ -286,7 +414,7 @@ app connects over that internal bridge without TLS, which MySQL 8's default
 | `IMAGE_TAG` required, no `latest` | a manual `compose up` silently fell back to an older local `latest` |
 | GHCR access checked before deploy | a new package was private and the server's token couldn't pull it |
 | `TRUSTED_PROXIES` covers the docker bridge | all users shared one IP and hit the login rate limit together |
-| `mysql_native_password` users | `ERROR 2061` on first connection over the docker bridge |
+| `SELECT VERSION()` before `CREATE USER`; new accounts `caching_sha2_password` | an account created `WITH mysql_native_password` (the earlier rule, written against `ERROR 2061` — a `mysql` CLI message, not one of the app's drivers) answers `Error 1524` once the server runs 8.4 |
 | No `default_server` | `nginx -t` failed with "duplicate default_server" |
 
 ## Never do

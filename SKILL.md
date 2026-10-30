@@ -161,7 +161,7 @@ Forbidden as the default dev workflow: `go run main.go`, `node server.js`, produ
 
 - **One image, one container** for the whole monorepo, built only by `.github/workflows/release-image.yml` (after `ci` is green on `main`) and pushed to GHCR as `:<git-sha>`. The server only pulls — never `docker build`, never `build:` in the prod compose.
 - On the server: `~/<slug>/` holds `docker-compose.prod.yml` (image-only, required `IMAGE_TAG`), `deploy.sh`, and `.env` (`chmod 600`, the only home of secrets). Deploy/rollback: `./deploy.sh <git-sha>` = preflight → pull → DB backup → migrate → up → wait for `/readyz`.
-- Database: the host's shared MySQL, `<slug>_db` + `<slug>_user@'172.%'` (`mysql_native_password`), reached via `host.docker.internal`. Never a database container.
+- Database: the host's shared MySQL, `<slug>_db` + `<slug>_user@'172.%'`, reached via `host.docker.internal`. Read `SELECT VERSION()` before `CREATE USER`: a new account uses `caching_sha2_password` on MySQL 8.0+; an existing `mysql_native_password` account on 8.0 is left as it is, and switched only before the server moves to 8.4+. Never a database container.
 - Network: `127.0.0.1:<port>` only, host nginx site with its own `server_name` (never `default_server`), TLS via certbot.
 - Image: non-root uid 10001, `ENTRYPOINT`, `HEALTHCHECK` on `/readyz`, migration tool inside.
 

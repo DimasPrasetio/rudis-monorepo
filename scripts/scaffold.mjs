@@ -536,14 +536,29 @@ your own machine for a quick check — never on the server. Set the DB env in \`
 | Server folder | \`~/${slug}\` (\`docker-compose.prod.yml\`, \`deploy.sh\`, \`.env\`, \`backups/\`) |
 | Container | \`${slug}-app\` |
 | Port | \`127.0.0.1:${hostPort}\` on the host → \`8080\` in the container |
-| Database / user | \`${dbName}\` / \`${slug}_user@'172.%'\` (\`mysql_native_password\`) |
+| Database / user | \`${dbName}\` / \`${slug}_user@'172.%'\` (\`caching_sha2_password\`) |
 | Image | \`${image}:<git-sha>\` (\`:latest\` is also pushed but never deployed) |
 | Domain | \`${domain}\` |
 
 One image serves the static frontend and the API on port 8080. The container reaches the
-host MySQL via \`host.docker.internal\` (\`extra_hosts: host-gateway\`). Users are created
-with \`mysql_native_password\` because the app connects over the internal docker bridge
-without TLS, which MySQL 8's default \`caching_sha2_password\` rejects (ERROR 2061).
+host MySQL via \`host.docker.internal\` (\`extra_hosts: host-gateway\`), over the docker bridge
+without TLS. The account uses \`caching_sha2_password\`: on a full authentication (first login,
+and the first after each MySQL restart),
+${backend === "go"
+  ? "the Go driver and golang-migrate ask the server for its RSA public key and send the\npassword encrypted — no DSN option needed."
+  : backend === "nestjs"
+  ? "Prisma 5 (app and \`migrate deploy\`) asks the server for its RSA public key and sends\nthe password encrypted — no URL option needed. Moving to Prisma 6/7 with\n\`@prisma/adapter-mariadb\` needs \`allowPublicKeyRetrieval: true\` on the adapter."
+  : "the driver must ask the server for its RSA public key: \`mysql2\` (and Knex/Drizzle on it)\ndoes, with no option; \`mariadb\` needs \`allowPublicKeyRetrieval: true\`; \`mysql\` (mysqljs)\ncannot sign in at all — never use it."}
+\`ERROR 2061\` comes from the \`mysql\` CLI without TLS — add \`--get-server-public-key\` when
+testing the account with it.
+
+**An account created earlier \`WITH mysql_native_password\`** (check:
+\`SELECT user, host, plugin FROM mysql.user WHERE user = '${slug}_user';\`): on MySQL 8.0 leave
+it as it is. Before the server is upgraded to 8.4 or 9.x — where that plugin is off or gone and
+the app fails with \`Error 1524\` — switch it while still on 8.0, with the owner's go-ahead,
+keeping the password inside \`${backend === "go" ? "DB_DSN" : "DATABASE_URL"}\` so \`.env\` stays as it is. The commands, the
+check and the undo are in the skill's references/docker-deployment.md › Accounts created
+with \`mysql_native_password\`.
 
 ## Release flow
 
@@ -592,10 +607,16 @@ Every step below changes the shared server — do it only with the owner's go-ah
 
 1. **Port** — take the next free port from the server's app registry (if it keeps one) and
    confirm it with \`ssh ${sshHost} 'sudo ss -tlnp'\`.
-2. **Database + dedicated user** on the host MySQL (password: \`openssl rand -hex 24\`):
+2. **Database + dedicated user** on the host MySQL (password: \`openssl rand -hex 24\`).
+   Read the version first — it decides the account plugin:
+   \`\`\`bash
+   sudo mysql -e 'SELECT VERSION();'
+   \`\`\`
+   MySQL 8.0, 8.4 or 9.x (MariaDB: \`IDENTIFIED BY '<random-hex>'\`, it has no
+   \`caching_sha2_password\`; MySQL 5.7 is end of life — upgrade first):
    \`\`\`sql
    CREATE DATABASE ${dbName} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-   CREATE USER '${slug}_user'@'172.%' IDENTIFIED WITH mysql_native_password BY '<random-hex>';
+   CREATE USER '${slug}_user'@'172.%' IDENTIFIED WITH caching_sha2_password BY '<random-hex>';
    GRANT ALL PRIVILEGES ON ${dbName}.* TO '${slug}_user'@'172.%';
    FLUSH PRIVILEGES;
    \`\`\`
