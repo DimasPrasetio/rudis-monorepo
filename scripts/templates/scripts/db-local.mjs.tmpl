@@ -1,0 +1,267 @@
+#!/usr/bin/env node
+// Prepares this app's databases on the MySQL of YOUR machine — run it yourself, in a terminal:
+//
+//   node scripts/db-local.mjs               asks the MySQL admin password (hidden), then creates
+//                                           __DB_MAIN__ and __DB_TEST__ and one account with rights on
+//                                           those two only, and writes __KEY_MAIN__ and __KEY_TEST__
+//                                           to .env (gitignored)
+//   node scripts/db-local.mjs --print-sql   prints the SQL it would run; connects to nothing
+//
+// Options: --admin-user root  --host localhost  --port 3306  --mysql <path to the mysql client>
+//          --replace (overwrite __KEY_MAIN__/__KEY_TEST__ in .env that point elsewhere)
+//          --server-version 8.4 (with --print-sql: the server to write the SQL for)
+//
+// The server version is read first (SELECT VERSION()): MySQL 8.0+ gets caching_sha2_password,
+// its default — mysql_native_password is disabled in 8.4 and gone in 9.x (Error 1524).
+// The account's password is random, never printed, and lives only in .env. Running it again
+// is safe: databases are kept, the account gets a new password and .env is updated with it.
+import { spawnSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
+import { chmodSync, copyFileSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const APP = "__SLUG__";
+const DATABASES = ["__DB_MAIN__", "__DB_TEST__"];
+const ACCOUNT = { user: `${APP}_dev`, host: "127.0.0.1" };
+const KEYS = ["__KEY_MAIN__", "__KEY_TEST__"];
+// "go": user:password@tcp(host:port)/db (Go MySQL driver) · "url": mysql://user:password@host:port/db
+const DSN_STYLE = "__DSN_STYLE__";
+
+const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+const ENV_FILE = join(root, ".env");
+
+function parseArgs(argv) {
+  const opts = { adminUser: "root", host: "localhost", port: "3306", mysql: null, printSql: false, replace: false, serverVersion: "8.4" };
+  const valued = { "--admin-user": "adminUser", "--host": "host", "--port": "port", "--mysql": "mysql", "--server-version": "serverVersion" };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--print-sql") opts.printSql = true;
+    else if (a === "--replace") opts.replace = true;
+    else if (a === "--help" || a === "-h") opts.help = true;
+    else if (valued[a] && argv[i + 1] !== undefined) opts[valued[a]] = argv[++i];
+    else fail(`unknown option ${a} — see node scripts/db-local.mjs --help`);
+  }
+  if (!/^\d+$/.test(opts.port)) fail(`--port must be a number (got ${opts.port})`);
+  return opts;
+}
+
+function fail(message) {
+  console.error(`db-local: ${message}`);
+  process.exit(1);
+}
+
+/** How CREATE USER names the password for this server, from SELECT VERSION(). */
+function authFor(version) {
+  if (/mariadb/i.test(version)) return { clause: "IDENTIFIED BY", plugin: "the MariaDB default" };
+  const major = Number(version.match(/^(\d+)\./)?.[1]);
+  if (!major) fail(`cannot read the server version from ${JSON.stringify(version)}`);
+  if (major >= 8) return { clause: "IDENTIFIED WITH caching_sha2_password BY", plugin: "caching_sha2_password" };
+  return { clause: "IDENTIFIED BY", plugin: "mysql_native_password (MySQL 5.7 is end-of-life — upgrade when you can)" };
+}
+
+function setupSql(auth, password) {
+  const account = `'${ACCOUNT.user}'@'${ACCOUNT.host}'`;
+  return [
+    ...DATABASES.map((db) => `CREATE DATABASE IF NOT EXISTS \`${db}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;`),
+    `CREATE USER IF NOT EXISTS ${account} ${auth.clause} '${password}';`,
+    // In a database-level GRANT "_" is a wildcard (app_db would also match appXdb): escape it.
+    ...DATABASES.map((db) => `GRANT ALL PRIVILEGES ON \`${db.replaceAll("_", "\\_")}\`.* TO ${account};`),
+    // Last: an existing account's password changes only once everything before it worked.
+    `ALTER USER ${account} ${auth.clause} '${password}';`,
+  ].join("\n") + "\n";
+}
+
+/**
+ * Random, and still accepted by validate_password's MEDIUM policy (upper, lower, digit, special),
+ * which some MySQL packages turn on. "-" is the only special character: it needs no escaping
+ * in SQL, an option file, a Go DSN, or a URL — and it never forms a "__X__" placeholder.
+ */
+function newPassword() {
+  return `${randomBytes(24).toString("base64url").replaceAll("_", "-")}-Aa1`;
+}
+
+function dsnFor(database, password, port) {
+  return DSN_STYLE === "go"
+    ? `${ACCOUNT.user}:${password}@tcp(${ACCOUNT.host}:${port})/${database}`
+    : `mysql://${ACCOUNT.user}:${password}@${ACCOUNT.host}:${port}/${database}`;
+}
+
+// --- .env -------------------------------------------------------------------------------
+
+const envLine = (key) => new RegExp(`^[ \\t]*${key}[ \\t]*=(.*)$`, "m");
+
+function envValue(text, key) {
+  const m = text.match(envLine(key));
+  return m ? m[1].trim() : undefined;
+}
+
+/** Stops before anything changes when .env could be committed or would lose a value. */
+function checkEnvFile(replace) {
+  // 0 = ignored, 1 = not ignored, anything else = no git here: fall back to reading .gitignore.
+  const status = spawnSync("git", ["check-ignore", "-q", ".env"], { cwd: root }).status;
+  const gitignore = existsSync(join(root, ".gitignore")) ? readFileSync(join(root, ".gitignore"), "utf8") : "";
+  const ignored = status === 0 || (status !== 1 && /^\/?\.env\s*$/m.test(gitignore));
+  if (!ignored) fail(".env is not ignored by git here — it would hold a password. Add .env to .gitignore first.");
+  if (!existsSync(ENV_FILE) || replace) return;
+  const text = readFileSync(ENV_FILE, "utf8");
+  const ours = DSN_STYLE === "go" ? `${ACCOUNT.user}:` : `mysql://${ACCOUNT.user}:`;
+  const foreign = KEYS.filter((k) => {
+    const v = envValue(text, k);
+    return v && !v.startsWith(ours);
+  });
+  if (foreign.length) fail(`${foreign.join(" and ")} in .env already point at another account — rerun with --replace to overwrite.`);
+}
+
+function writeEnv(values) {
+  if (!existsSync(ENV_FILE)) copyFileSync(join(root, ".env.example"), ENV_FILE);
+  let text = readFileSync(ENV_FILE, "utf8");
+  const eol = text.includes("\r\n") ? "\r\n" : "\n";
+  for (const [key, value] of Object.entries(values)) {
+    const line = envLine(key);
+    if (line.test(text)) text = text.replace(line, () => `${key}=${value}`);
+    else text += `${text.endsWith(eol) || text === "" ? "" : eol}${key}=${value}${eol}`;
+  }
+  writeFileSync(ENV_FILE, text);
+  try { chmodSync(ENV_FILE, 0o600); } catch {}
+}
+
+// --- the mysql client ---------------------------------------------------------------------
+
+function findClient(explicit) {
+  if (explicit) return existsSync(explicit) ? explicit : fail(`--mysql ${explicit} does not exist`);
+  if (process.platform === "win32") {
+    // The client next to the server that is running (Laragon, XAMPP, an installer): it matches
+    // that server, and none of them puts its bin folder on PATH. Reads the process list only.
+    const running = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command",
+      "(Get-Process mysqld,mariadbd -ErrorAction SilentlyContinue).Path"], { encoding: "utf8" });
+    for (const server of (running.stdout ?? "").split(/\r?\n/).filter(Boolean)) {
+      for (const name of ["mysql.exe", "mariadb.exe"]) {
+        if (existsSync(join(dirname(server), name))) return join(dirname(server), name);
+      }
+    }
+  }
+  if (spawnSync("mysql", ["--version"], { stdio: "ignore" }).status === 0) return "mysql";
+  if (process.platform === "win32") {
+    const found = [];
+    for (const base of [process.env.ProgramFiles, process.env["ProgramFiles(x86)"]].filter(Boolean)) {
+      for (const vendor of ["MySQL", "MariaDB"]) {
+        const dir = join(base, vendor);
+        const servers = existsSync(dir) ? readdirSync(dir) : [];
+        for (const server of servers) {
+          const exe = join(dir, server, "bin", "mysql.exe");
+          if (existsSync(exe)) found.push(exe);
+        }
+      }
+      for (const entry of existsSync(base) ? readdirSync(base).filter((d) => /^MariaDB /.test(d)) : []) {
+        const exe = join(base, entry, "bin", "mysql.exe");
+        if (existsSync(exe)) found.push(exe);
+      }
+    }
+    if (found.length) return found.sort().at(-1);
+  }
+  fail("the mysql client was not found — put it on PATH or pass --mysql <path to mysql(.exe)>");
+}
+
+// The option files hold passwords: removed after each call, and on any exit or Ctrl+C on the way.
+const optionDirs = new Set();
+const removeOptionDirs = () => {
+  for (const dir of optionDirs) rmSync(dir, { recursive: true, force: true });
+  optionDirs.clear();
+};
+process.on("exit", removeOptionDirs);
+process.on("SIGINT", () => process.exit(130));
+
+/** Runs the client with credentials from a private option file, never from the command line. */
+function mysql(client, credentials, args, input) {
+  const dir = mkdtempSync(join(tmpdir(), `${APP}-db-`));
+  optionDirs.add(dir);
+  const file = join(dir, "client.cnf");
+  const quote = (v) => `"${String(v).replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+  let r;
+  try {
+    writeFileSync(file, `[client]\nuser=${quote(credentials.user)}\npassword=${quote(credentials.password)}\nhost=${quote(credentials.host)}\nport=${credentials.port}\nconnect-timeout=10\n`, { mode: 0o600 });
+    r = spawnSync(client, [`--defaults-extra-file=${file}`, ...args], { input, encoding: "utf8" });
+  } finally {
+    removeOptionDirs();
+  }
+  if (r.error) fail(`could not run ${client}: ${r.error.message}`);
+  return r;
+}
+
+function askHidden(question) {
+  if (!process.stdin.isTTY) {
+    fail("run this in an interactive terminal (PowerShell, cmd, Terminal) — it asks for the MySQL admin password. In Git Bash: winpty node scripts/db-local.mjs");
+  }
+  return new Promise((resolve) => {
+    let answer = "";
+    process.stdout.write(question);
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+    process.stdin.setEncoding("utf8");
+    const onData = (chunk) => {
+      for (const ch of chunk) {
+        if (ch === "\r" || ch === "\n") {
+          process.stdin.setRawMode(false);
+          process.stdin.pause();
+          process.stdin.off("data", onData);
+          process.stdout.write("\n");
+          return resolve(answer);
+        }
+        if (ch === "\u0003") {
+          process.stdin.setRawMode(false);
+          process.stdout.write("\n");
+          process.exit(130);
+        }
+        if (ch === "\u0008" || ch === "\u007f") answer = answer.slice(0, -1);
+        else answer += ch;
+      }
+    };
+    process.stdin.on("data", onData);
+  });
+}
+
+// --- main ---------------------------------------------------------------------------------
+
+const opts = parseArgs(process.argv.slice(2));
+if (opts.help) {
+  const header = readFileSync(fileURLToPath(import.meta.url), "utf8").split(/\r?\n/).slice(1);
+  console.log(header.slice(0, header.findIndex((l) => !l.startsWith("//"))).map((l) => l.replace(/^\/\/ ?/, "")).join("\n"));
+  process.exit(0);
+}
+
+if (opts.printSql) {
+  const auth = authFor(opts.serverVersion);
+  console.log(`-- ${DATABASES.join(" + ")} and '${ACCOUNT.user}'@'${ACCOUNT.host}' on server ${opts.serverVersion} (${auth.plugin}).`);
+  console.log("-- Nothing was run. <password> is random (36 characters: letters, digits, \"-\"), written only to .env.");
+  process.stdout.write(setupSql(auth, "<password>"));
+  console.log(`-- .env:\n${KEYS.map((k, i) => `-- ${k}=${dsnFor(DATABASES[i], "<password>", opts.port)}`).join("\n")}`);
+  process.exit(0);
+}
+
+checkEnvFile(opts.replace);
+const client = findClient(opts.mysql);
+const adminPassword = await askHidden(`MySQL password for ${opts.adminUser}@${opts.host}:${opts.port} (not shown, not saved): `);
+const admin = { user: opts.adminUser, password: adminPassword, host: opts.host, port: opts.port };
+
+const probe = mysql(client, admin, ["-N", "-B", "-e", "SELECT VERSION()"]);
+if (probe.status !== 0) fail(`could not sign in as ${opts.adminUser}:\n${probe.stderr.trim()}`);
+const version = probe.stdout.trim();
+const auth = authFor(version);
+console.log(`MySQL server ${version} → account plugin: ${auth.plugin}`);
+
+const password = newPassword();
+const setup = mysql(client, admin, [], setupSql(auth, password));
+if (setup.status !== 0) fail(`the setup SQL failed — nothing was written to .env:\n${setup.stderr.trim()}`);
+// The account now has this password: .env gets it before anything else can fail.
+writeEnv(Object.fromEntries(KEYS.map((k, i) => [k, dsnFor(DATABASES[i], password, opts.port)])));
+
+// Sign in as the new account, over TCP like the app does, and see both databases.
+const app = { user: ACCOUNT.user, password, host: ACCOUNT.host, port: opts.port };
+const check = mysql(client, app, ["--protocol=TCP", "-N", "-B", "-e",
+  `SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME IN (${DATABASES.map((d) => `'${d}'`).join(", ")})`]);
+if (check.status !== 0 || check.stdout.trim() !== String(DATABASES.length)) {
+  fail(`${KEYS.join(" and ")} were written to .env, but the new account could not sign in over TCP at ${ACCOUNT.host}:${opts.port} or see its databases (a MySQL in a container sees another client address — this script is for a MySQL installed on this machine):\n${(check.stderr || check.stdout).trim()}`);
+}
+console.log(`✓ ${DATABASES.join(" and ")} ready for '${ACCOUNT.user}'@'${ACCOUNT.host}'; ${KEYS.join(" and ")} written to .env`);

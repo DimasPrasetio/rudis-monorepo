@@ -69,6 +69,8 @@ The standard is intentionally anti-overengineering: a modular monolith with clea
    If the target directory already has files in it (e.g. an existing `.git/`), add `--force`.
 
    Run `node scripts/scaffold.mjs --help` for options. After scaffolding, read the relevant reference file(s) below and fill in project-specific code, modules, and `knowledge/` content.
+
+   The local databases come from `node scripts/db-local.mjs`, which **the user runs in their own terminal** — it asks their MySQL admin password itself, so never ask for it, never run it for them, and never fill a DSN into `.env` or `.env.example` yourself. Until then, nothing in the project touches MySQL. A script that drops or rebuilds a database checks its target with `scripts/db-guard.mjs` first, and its refusals are tested on the guard, never by running it with a bad value — [references/local-database.md](references/local-database.md).
 2. **Before building any UI, research the design** — follow [references/design-research.md](references/design-research.md): pin down the app type, users, primary device, and locale; research current sources on the internet (real products of that app type, a fitting design system, UX research); write the brief into `knowledge/DESIGN.md`; then build the screens through `frontend-design` from that brief. Never start UI from a generic template or from memory alone. Not needed when only restyling or fixing a screen the brief already covers. The brief also decides whether a theme preset from the module library is the starting point.
 3. **Assemble from the module library before writing features** (Go backend) — follow [references/module-library.md](references/module-library.md): read the library's `CATALOG.md`, split the requirement into capabilities, decide per capability *install / install + adapt / build*, confirm that table with the user once, install with `module.mjs` (preset → ui kits → providers → consumers, ports wired), then build only what is custom — to the same standard, so it could join the library later. Applies to a new project and to every new feature.
 4. **For auditing/restructuring an existing repo**, skip the script and check the repo against the [Final Checklist](#final-checklist) plus the relevant references.
@@ -89,6 +91,7 @@ The body below is the always-loaded summary. Detailed, stack-specific rules live
 | Design research before UI: what to research, source quality, the `knowledge/DESIGN.md` brief | [references/design-research.md](references/design-research.md) |
 | Module library: find, install, wire, upgrade, and promote reusable modules (`module.mjs`, `modules.lock.json`) | [references/module-library.md](references/module-library.md) |
 | API conventions + env standard | [references/api-standard.md](references/api-standard.md) |
+| Local databases (`db-local.mjs`), the MySQL account plugin and Error 1524, guarding scripts that rebuild a database, `check-migrations` | [references/local-database.md](references/local-database.md) |
 | Deployment: Docker image, CI → GHCR, deploy server (compose, deploy.sh, nginx, MySQL) | [references/docker-deployment.md](references/docker-deployment.md) |
 
 ## High-Level Monorepo Structure

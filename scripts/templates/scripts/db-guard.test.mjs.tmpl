@@ -1,0 +1,80 @@
+// npm run test:scripts — the refusals of scripts/db-guard.mjs, with no database.
+import assert from "node:assert/strict";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { test } from "node:test";
+import { checkTestDsn, loadDotEnv, parseDsn, resolveTestDsn } from "./db-guard.mjs";
+
+const accepted = [
+  "u:p@tcp(localhost:3306)/app_test",
+  "u:p@tcp(127.0.0.1)/app_test?parseTime=true",
+  "root:@tcp(127.0.0.1:3306)/app_test",
+  "u:p@w@tcp(localhost:3306)/app_test",
+  "u:p)/x@tcp(localhost:3306)/app_test",
+];
+const refused = [
+  undefined,
+  "",
+  "   ",
+  "garbage",
+  "u:p@tcp(localhost:3306)/app_db",
+  "u:p@tcp(localhost:3306)/prod?x=/y_test",
+  "u:p/x_test?@tcp(localhost)/prod",
+  "u:p@tcp(db.example.com:3306)/app_test",
+  "u:p@tcp(localhost.evil.com)/app_test",
+  "u:p@tcp(127.0.0.1.evil.com:3306)/app_test",
+  "u:p@tcp(localhost:3306:1)/app_test",
+  "u:p@tcp(localhost:3306)/",
+  "u:p@tcp(localhost:3306)/_test",
+  "u:p@tcp(localhost:3306)/a/b_test",
+  "u:p@tcp(localhost:3306)/app-x_test",
+  "__FILL_USER__:__FILL_PASSWORD__@tcp(localhost:3306)/app_test",
+  "<user>:<password>@tcp(localhost:3306)/app_test",
+  "u:p@unix(/tmp/mysql.sock)/app_test",
+  "tcp(localhost:3306)/app_test",
+];
+
+for (const dsn of accepted) test(`accepts ${dsn}`, () => assert.equal(checkTestDsn(dsn).ok, true));
+for (const dsn of refused) test(`refuses ${JSON.stringify(dsn)}`, () => assert.equal(checkTestDsn(dsn).ok, false));
+
+test("the database is what follows the address, whatever the password holds", () => {
+  assert.deepEqual(parseDsn("u:p)/z_test@tcp(127.0.0.1:3307)/app_test?x=1"), {
+    user: "u", host: "127.0.0.1", port: 3307, database: "app_test", params: "?x=1",
+  });
+});
+
+function withEnvFile(content, fn) {
+  const dir = mkdtempSync(join(tmpdir(), "db-guard-"));
+  try {
+    writeFileSync(join(dir, ".env"), content);
+    return fn(join(dir, ".env"));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test("a variable emptied on purpose is refused, not refilled from .env", () => {
+  withEnvFile("TEST_DB_DSN=u:p@tcp(localhost:3306)/app_test\n", (file) => {
+    const r = resolveTestDsn({ env: { TEST_DB_DSN: "" }, file });
+    assert.equal(r.ok, false);
+    assert.equal(r.source, "environment");
+  });
+});
+
+test("an unset variable is read from .env and still checked", () => {
+  withEnvFile("TEST_DB_DSN=u:p@tcp(localhost:3306)/app_db\r\n", (file) => {
+    assert.equal(resolveTestDsn({ env: {}, file }).ok, false);
+  });
+  withEnvFile("TEST_DB_DSN=u:p@tcp(localhost:3306)/app_test\r\n", (file) => {
+    assert.equal(resolveTestDsn({ env: {}, file }).ok, true);
+  });
+});
+
+test("loadDotEnv keeps a variable that is set, even to an empty string", () => {
+  withEnvFile("DB_DSN=from-file\nAPP_PORT=8080\n", (file) => {
+    const env = { DB_DSN: "" };
+    loadDotEnv(file, env);
+    assert.deepEqual(env, { DB_DSN: "", APP_PORT: "8080" });
+  });
+});
