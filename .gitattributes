@@ -1,0 +1,5 @@
+# LF in every checkout, whatever core.autocrlf says: check-drift fingerprints the generated
+# files byte for byte, and Git for Windows' default (autocrlf=true) checks them out as CRLF,
+# which fails the module contract and the pre-commit hook on any Windows clone.
+* text=auto eol=lf
+*.skill binary
