@@ -193,6 +193,8 @@ const rootScripts = {
     "migrate:down": "node scripts/migrate.mjs down 1",
     "migrate:create": "cd apps/api && migrate create -ext sql -dir migrations",
     "sqlc:generate": "node scripts/sqlc.mjs",
+    "smoke": "node scripts/smoke.mjs",
+    "test:scripts": "node --test scripts/db-guard.test.mjs",
   },
   nestjs: {
     "dev:web": "npm run dev -w apps/web",
@@ -271,9 +273,20 @@ infra/deploy
 
 const dbName = `${slug}_db`;
 
-const dbUrlLine = backend === "go"
-  ? `# Go DSN (database/sql + MySQL driver) — no scheme prefix\nDB_DSN=root:@tcp(localhost:3306)/${dbName}`
-  : `# Prisma URI\nDATABASE_URL=mysql://root:password@localhost:3306/${dbName}`;
+// Local databases: `node scripts/db-local.mjs`, run by the developer, creates <slug>_db and
+// <slug>_test with one account and fills these two keys in .env. They stay EMPTY here: a
+// placeholder shaped like a real DSN gets used against whatever MySQL listens on 3306.
+const testDbName = `${slug}_test`;
+const dbKeys = backend === "go" ? ["DB_DSN", "TEST_DB_DSN"] : ["DATABASE_URL", "TEST_DATABASE_URL"];
+const dbUrlLine = `# Filled by \`node scripts/db-local.mjs\` (creates ${dbName} + ${testDbName} on your MySQL).
+# ${backend === "go" ? "Go DSN, no scheme: user:password@tcp(127.0.0.1:3306)/" + dbName : "Prisma URI: mysql://user:password@127.0.0.1:3306/" + dbName}
+${dbKeys[0]}=
+# The test database — rebuilt by every test run, so its name must end in _test.
+${dbKeys[1]}=`;
+template("scripts/db-local.mjs.tmpl", "scripts/db-local.mjs", {
+  __SLUG__: slug, __DB_MAIN__: dbName, __DB_TEST__: testDbName,
+  __KEY_MAIN__: dbKeys[0], __KEY_TEST__: dbKeys[1], __DSN_STYLE__: backend === "go" ? "go" : "url",
+});
 
 file(".env.example", `APP_ENV=development
 APP_PORT=8080
@@ -319,6 +332,15 @@ file("README.md", `# ${name}
 Monorepo generated to the Rudis standard (modular-monolith backend + React 19 frontend).
 
 ## Development
+
+The API needs its databases first. Once, yourself, in a terminal: it asks your MySQL admin
+password (never stored), creates \`${dbName}\` and \`${testDbName}\` with one account that
+may use only those two, and writes \`${dbKeys[0]}\` and \`${dbKeys[1]}\` to \`.env\`
+(\`--print-sql\` shows the SQL without running it):
+
+\`\`\`bash
+node scripts/db-local.mjs
+${backend === "express" ? "" : "npm run migrate:up\n"}\`\`\`
 
 Run frontend and backend separately from the project root:
 
@@ -806,7 +828,11 @@ Applies to: \`apps/api/**\`.
   half-way cannot roll back.
 - Times are stored in UTC (the API's DB sessions run in UTC); "today" for a user is computed
   in Asia/Jakarta in code.
-${backend === "go" ? "- Go: golang-migrate for migrations (timestamp-versioned; CI refuses one older than the newest\n  on main — \`node scripts/check-migrations.mjs <base> --fix\` renames it), sqlc for access (one\n  generated package per module), database/sql + MySQL driver. Not GORM.\n" : ""}${backend === "nestjs" ? "- NestJS: Prisma migrations (not TypeORM unless explicitly requested).\n" : ""}${backend === "express" ? "- Express: migration tool is not locked — confirm the choice before implementing migrations.\n" : ""}`);
+- A script that drops or rebuilds a database checks its target first — ${backend === "go" ? "\`scripts/db-guard.mjs\`: " : ""}a
+  local host and a name ending in \`_test\` — before it loads \`.env\`, and a variable set to ""
+  is refused, never refilled from the file. Test its refusals on the guard function with no
+  database (${backend === "go" ? "\`npm run test:scripts\`" : "a unit test"}), never by running the destructive script with a bad value.
+${backend === "go" ? "- Go: golang-migrate for migrations (timestamp-versioned; CI refuses one older than the newest\n  on main — \`node scripts/check-migrations.mjs <base> --fix\` renames it; \"not applicable\"\n  while the base has no migrations yet, e.g. the first commit), sqlc for access (one\n  generated package per module), database/sql + MySQL driver. Not GORM.\n" : ""}${backend === "nestjs" ? "- NestJS: Prisma migrations (not TypeORM unless explicitly requested).\n" : ""}${backend === "express" ? "- Express: migration tool is not locked — confirm the choice before implementing migrations.\n" : ""}`);
 file(".claude/rules/deployment.md", `# Rule: Deployment (deploy server)
 
 Applies to: \`infra/**\`, \`.github/workflows/**\`, \`docker-compose.yml\`, \`.dockerignore\`.
@@ -1383,7 +1409,7 @@ ${ciApiJob}  build:
       - name: install
         run: if [ -f package-lock.json ]; then npm ci; else npm install; fi
       - run: npm run build:web
-${isNodeBackend ? "      - run: npm run build:api\n" : ""}`);
+${isNodeBackend ? "      - run: npm run build:api\n" : ""}${backend === "go" ? "      - run: npm run test:scripts\n" : ""}`);
 
 file(".github/workflows/release-image.yml", `# Build & push the app image to GHCR — the deploy server only pulls it, never builds.
 # Runs ONLY after the \`ci\` workflow passed for a push to main, on that exact commit
@@ -2414,6 +2440,9 @@ process.exit(r.status ?? 1);
 // added on a branch with a timestamp older than one already merged would never run anywhere
 // that ran the newer one — silently. CI runs this against the base commit; it fails on such a
 // file, and --fix gives it (and its .down) a fresh timestamp after the newest one.
+// "Not applicable" (exit 0, not a failure) when there is nothing to compare against: no base
+// commit (a branch's first push), a base outside this checkout, or a base without
+// apps/api/migrations yet — the project's first commit, where every migration is new.
 //
 // Usage: node scripts/check-migrations.mjs <base-commit> [--fix]
 import { execFileSync } from "node:child_process";
@@ -2421,18 +2450,23 @@ import { existsSync, readFileSync, readdirSync, renameSync, writeFileSync } from
 
 const DIR = "apps/api/migrations";
 const [base, flag] = process.argv.slice(2);
-const git = (...args) => execFileSync("git", args, { encoding: "utf8" });
+const git = (...args) => execFileSync("git", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
 const version = (f) => f.match(/^(\\d{14})_/)?.[1];
 
-if (!base || /^0+$/.test(base)) {
-  console.log("check-migrations: no base commit (first push of a branch) — skipped");
+const notApplicable = (why) => {
+  console.log(\`check-migrations: not applicable — \${why}\`);
   process.exit(0);
-}
+};
+if (!base || /^0+$/.test(base)) notApplicable("no base commit (first push of a branch)");
 try {
   git("cat-file", "-e", \`\${base}^{commit}\`);
 } catch {
-  console.log(\`check-migrations: \${base} is not in this checkout (fetch-depth 0?) — skipped\`);
-  process.exit(0);
+  notApplicable(\`\${base} is not in this checkout (fetch-depth 0?)\`);
+}
+try {
+  git("cat-file", "-e", \`\${base}:\${DIR}\`);
+} catch {
+  notApplicable(\`\${base} has no \${DIR} yet (the project's first commit) — nothing to be older than\`);
 }
 const before = git("ls-tree", "--name-only", \`\${base}:\${DIR}\`).split("\\n").map(version).filter(Boolean);
 const newest = before.sort().at(-1) ?? "0";
@@ -2469,23 +2503,24 @@ if (lock) writeFileSync(lockFile, lock);
 console.log("✓ renamed — commit the change");
 `);
 
+  // The guard every database-rebuilding script runs first, its tests, and the smoke test
+  // that uses it — references/local-database.md.
+  template("scripts/db-guard.mjs.tmpl", "scripts/db-guard.mjs");
+  template("scripts/db-guard.test.mjs.tmpl", "scripts/db-guard.test.mjs");
+  template("scripts/smoke.mjs.tmpl", "scripts/smoke.mjs", { __SLUG__: slug, __DB_TEST__: testDbName });
   file("scripts/migrate.mjs", `#!/usr/bin/env node
 // golang-migrate wrapper that works the same in PowerShell, cmd, and sh.
 // npm runs scripts through cmd.exe on Windows, which does not expand $VAR — so the DB
-// connection is read here from .env and passed as a literal argument instead.
-import { readFileSync, existsSync } from "node:fs";
+// connection is read here from .env and passed as a literal argument instead. A DB_DSN already
+// in the environment wins, even an empty one (scripts/smoke.mjs passes the test database's).
 import { spawnSync } from "node:child_process";
+import { loadDotEnv } from "./db-guard.mjs";
 
-if (existsSync(".env")) {
-  for (const line of readFileSync(".env", "utf8").split(/\\r?\\n/)) {
-    const m = line.match(/^\\s*([A-Z0-9_]+)\\s*=\\s*(.*)\\s*$/);
-    if (m && !process.env[m[1]]) process.env[m[1]] = m[2];
-  }
-}
+loadDotEnv(".env");
 
 const dsn = process.env.DB_DSN;
 if (!dsn) {
-  console.error("DB_DSN not found. Copy .env.example to .env and fill in DB_DSN.");
+  console.error("DB_DSN is empty. Run node scripts/db-local.mjs to create the local databases and fill it in .env.");
   process.exit(1);
 }
 
@@ -2705,8 +2740,8 @@ process.stdout.write(
   `  ${written} files written.\n\n` +
   `Next steps:\n` +
   `  1. Read the matching reference(s) in the skill and fill in modules + knowledge/.\n` +
-  `  2. cp .env.example .env  and adjust.\n` +
-  `  3. npm install\n` +
+  `  2. npm install\n` +
+  `  3. The user runs  node scripts/db-local.mjs  in their own terminal (local MySQL databases + .env).\n` +
   `  4. npm run dev:web   /   npm run dev:api\n` +
   (backend === "go" ? `  5. cd apps/api && go mod tidy   (commit go.sum — the image build needs it)\n` : "") +
   `\nDeploy target: ${targetLabel} as "${slug}" — facts in knowledge/DEPLOYMENT.md.\n` +

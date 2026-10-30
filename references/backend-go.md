@@ -44,10 +44,15 @@ Rules:
     "migrate:up": "node scripts/migrate.mjs up",
     "migrate:down": "node scripts/migrate.mjs down 1",
     "migrate:create": "cd apps/api && migrate create -ext sql -dir migrations",
-    "sqlc:generate": "node scripts/sqlc.mjs"
+    "sqlc:generate": "node scripts/sqlc.mjs",
+    "smoke": "node scripts/smoke.mjs",
+    "test:scripts": "node --test scripts/db-guard.test.mjs"
   }
 }
 ```
+
+`smoke` rebuilds the `_test` database and checks the running API; `test:scripts` tests the
+guard that stops it from rebuilding any other — [local-database.md](local-database.md).
 
 ## Watcher: `apps/api/.air.toml`
 

@@ -1,0 +1,78 @@
+// The safety check of every script that rebuilds a database (scripts/smoke.mjs runs
+// `migrate drop`), kept apart so its refusals are tested without a database:
+// `npm run test:scripts`. Never test a refusal by running the destructive script with a bad
+// value — a guard that is wrong then destroys the database it was meant to protect.
+//
+// A database may be rebuilt only when its DSN is exactly
+//   user:password@tcp(localhost|127.0.0.1[:port])/<name>_test[?params]
+// The password may hold any character ("@", "/", ")"): user and password are everything before
+// the LAST "@tcp(", and the database is what follows the ")/" that closes the address — the same
+// split the Go MySQL driver makes. Parameters may not hold "/", where the driver would disagree.
+import { existsSync, readFileSync } from "node:fs";
+
+const SHAPE = /^(.*)@tcp\(([^()]*)\)\/([^/?]*)(\?[^/]*)?$/s;
+const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1"]);
+// "__FILL_ME__", "<password>": a value nobody filled in yet.
+const PLACEHOLDER = /__[A-Z0-9_]+__|<[^<>]*>/;
+
+/** Splits a Go MySQL DSN over TCP. Returns null when it does not have that shape. */
+export function parseDsn(dsn) {
+  const m = typeof dsn === "string" ? SHAPE.exec(dsn) : null;
+  if (!m) return null;
+  const [, userinfo, address, database, params = ""] = m;
+  const port = address.match(/:(\d+)$/)?.[1];
+  const host = port ? address.slice(0, -(port.length + 1)) : address;
+  const colon = userinfo.indexOf(":");
+  return {
+    user: colon === -1 ? userinfo : userinfo.slice(0, colon),
+    host,
+    port: port ? Number(port) : 3306,
+    database,
+    params,
+  };
+}
+
+/** { ok: true, host, database } for a DSN that is safe to rebuild, else { ok: false, reason }. */
+export function checkTestDsn(dsn, name = "TEST_DB_DSN") {
+  if (typeof dsn !== "string" || dsn.trim() === "") return { ok: false, reason: `${name} is empty` };
+  if (PLACEHOLDER.test(dsn)) return { ok: false, reason: `${name} still holds a placeholder` };
+  const d = parseDsn(dsn);
+  if (!d) return { ok: false, reason: `${name} must look like user:password@tcp(127.0.0.1:3306)/<name>_test` };
+  if (!LOCAL_HOSTS.has(d.host)) return { ok: false, reason: `host "${d.host}" is not localhost or 127.0.0.1` };
+  if (!/^[A-Za-z0-9_]+_test$/.test(d.database)) {
+    return { ok: false, reason: `database "${d.database}" does not end in _test` };
+  }
+  return { ok: true, host: d.host, database: d.database };
+}
+
+/** The KEY=value pairs of an env file ({} when it does not exist). Values are taken as written. */
+export function readDotEnv(file = ".env") {
+  const out = {};
+  if (!existsSync(file)) return out;
+  for (const line of readFileSync(file, "utf8").split(/\r?\n/)) {
+    const m = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/);
+    if (m) out[m[1]] = m[2];
+  }
+  return out;
+}
+
+/**
+ * Copies an env file into env, never over a variable that is already set — even to "": a
+ * value someone emptied on purpose stays empty instead of falling back to the file.
+ */
+export function loadDotEnv(file = ".env", env = process.env) {
+  for (const [key, value] of Object.entries(readDotEnv(file))) {
+    if (!Object.hasOwn(env, key)) env[key] = value;
+  }
+}
+
+/**
+ * The DSN a destructive script may use, checked BEFORE anything is loaded from the env file:
+ * a variable set in the environment (even to "") is the answer and the file is not read;
+ * only an unset one is looked up in the file.
+ */
+export function resolveTestDsn({ name = "TEST_DB_DSN", env = process.env, file = ".env" } = {}) {
+  const fromEnv = Object.hasOwn(env, name);
+  const dsn = fromEnv ? env[name] : readDotEnv(file)[name];
+  return { ...checkTestDsn(dsn, name), dsn, source: fromEnv ? "environment" : file };
+}

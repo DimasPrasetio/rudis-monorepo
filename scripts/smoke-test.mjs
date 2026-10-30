@@ -106,6 +106,15 @@ function readEnvVar(dir, key) {
   return undefined;
 }
 
+const UNREACHABLE_DSN = "smoke:smoke@tcp(127.0.0.1:1)/smoke_db";
+
+function setEnvVar(dir, key, value) {
+  const p = join(dir, ".env");
+  const text = readFileSync(p, "utf8");
+  const line = new RegExp(`^${key}=.*$`, "m");
+  writeFileSync(p, line.test(text) ? text.replace(line, () => `${key}=${value}`) : `${text}${key}=${value}\n`);
+}
+
 class ProcessExitedEarlyError extends Error {
   constructor(code) {
     super(`process exited early (code ${code}) before the health check ever succeeded`);
@@ -337,6 +346,11 @@ async function testStack(stack) {
     pass("scaffold");
 
     copyFileSync(join(dir, ".env.example"), join(dir, ".env"));
+    // .env.example leaves DB_DSN empty (scripts/db-local.mjs fills it on a developer's machine)
+    // and the Go API refuses to start without one. Without SMOKE_DB_DSN, point it at a port
+    // nothing listens on: the API runs, /readyz answers 503, and no MySQL on this machine is
+    // ever contacted.
+    if (stack === "go") setEnvVar(dir, "DB_DSN", process.env.SMOKE_DB_DSN || UNREACHABLE_DSN);
 
     // 2. npm install
     const install = run("npm", ["install", "--no-audit", "--no-fund"], { cwd: dir });

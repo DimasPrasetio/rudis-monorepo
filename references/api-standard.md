@@ -76,12 +76,15 @@ VITE_API_BASE_URL=
 The DB connection string has **two different valid formats** — pick the one that matches the stack, never a value that mixes both:
 
 ```env
-# Go — DSN consumed by database/sql, no URI scheme
-DB_DSN=root:@tcp(localhost:3306)/app_db
+# Go — DSN consumed by database/sql, no URI scheme: user:pass@tcp(127.0.0.1:3306)/app_db
+DB_DSN=
 
-# NestJS/Express — Prisma-style URI
-DATABASE_URL=mysql://root:password@localhost:3306/app_db
+# NestJS/Express — Prisma-style URI: mysql://user:pass@127.0.0.1:3306/app_db
+DATABASE_URL=
 ```
+
+Both stay empty in `.env.example`, never a sample value: `node scripts/db-local.mjs` fills
+them in `.env` — [local-database.md](local-database.md).
 
 - Go uses `DB_DSN` (`user:pass@tcp(host:port)/db`), not a scheme-prefixed URI. `database/sql` cannot parse a `mysql://` prefix, and golang-migrate's own URL is derived from this DSN at the point it's invoked (see `scripts/migrate.mjs`), not stored as a second variable.
 - NestJS/Express use `DATABASE_URL` (`mysql://user:pass@host:port/db`). Prisma rejects the Go `@tcp(...)` form.

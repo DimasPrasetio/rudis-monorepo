@@ -14,7 +14,7 @@
     "apps/api/internal/kernel/events.go": "e5f1e275ed804432",
     "apps/api/internal/kernel/http.go": "51ea4fe0e56263a3",
     "apps/api/internal/kernel/kerneltest/kerneltest.go": "36feee05407cd350",
-    "apps/api/internal/config/config.go": "6704c7264dc3f964",
+    "apps/api/internal/config/config.go": "8538512845e80f2f",
     "apps/api/internal/shared/apperror/apperror.go": "0cb60c60bc18c07c",
     "apps/api/internal/shared/pagination/pagination.go": "b2ae88cd1c463190",
     "apps/api/internal/shared/request/request.go": "b26b4c871d35075a",

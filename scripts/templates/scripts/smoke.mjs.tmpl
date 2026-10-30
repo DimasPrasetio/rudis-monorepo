@@ -1,0 +1,101 @@
+#!/usr/bin/env node
+// Smoke test against a real MySQL: rebuild the test database from the migrations, build and
+// start the API, and check that it answers. Add this app's own flows to `checks` below.
+//
+//   npm run smoke      TEST_DB_DSN from the environment, else from the gitignored .env
+//
+// It DROPS everything in the database TEST_DB_DSN names, so scripts/db-guard.mjs must accept
+// that DSN first — a local host and a name ending in _test — and it is checked before .env is
+// loaded: a TEST_DB_DSN set to "" is refused, never refilled from the file. `node scripts/db-local.mjs`
+// creates __DB_TEST__ and writes TEST_DB_DSN. Test refusals with `npm run test:scripts`, never
+// by running this script with a bad value.
+import { spawn, spawnSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { resolveTestDsn } from "./db-guard.mjs";
+
+const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+const target = resolveTestDsn({ file: join(root, ".env") });
+if (!target.ok) {
+  console.error(`smoke: refusing to run — ${target.reason} (from ${target.source}). It rebuilds the database, so it must be a local one ending in _test.`);
+  process.exit(2);
+}
+const dsn = target.dsn;
+const port = Number(process.env.SMOKE_PORT || 18090);
+const base = `http://127.0.0.1:${port}`;
+
+let failed = 0;
+const expect = (label, cond, detail) => {
+  if (cond) console.log(`  ok   ${label}`);
+  else {
+    failed++;
+    console.log(`  FAIL ${label}${detail === undefined ? "" : ` — ${JSON.stringify(detail).slice(0, 300)}`}`);
+  }
+};
+
+// This app's own flows, against the running API. Each call: await call("POST", "/api/v1/...", body).
+async function checks(call) {
+  const health = await call("GET", "/api/v1/health");
+  expect("GET /api/v1/health → 200", health.status === 200 && health.body?.success === true, health.body);
+  const ready = await call("GET", "/readyz");
+  expect("GET /readyz → 200 (the database answers)", ready.status === 200, ready.body);
+}
+
+async function call(method, path, body) {
+  const res = await fetch(base + path, {
+    method,
+    headers: body ? { "Content-Type": "application/json" } : {},
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const text = await res.text();
+  let parsed = text;
+  try { parsed = JSON.parse(text); } catch {}
+  return { status: res.status, body: parsed };
+}
+
+function step(label, cmd, args, opts) {
+  console.log(label);
+  const r = spawnSync(cmd, args, { stdio: "inherit", ...opts });
+  if (r.status !== 0) throw new Error(`${label} failed${r.error ? `: ${r.error.message}` : ""}`);
+}
+
+const env = { ...process.env, DB_DSN: dsn };
+const tmp = mkdtempSync(join(tmpdir(), "__SLUG__-smoke-"));
+const exe = join(tmp, process.platform === "win32" ? "api.exe" : "api");
+let api;
+try {
+  step(`migrate: rebuild ${target.database}`, process.execPath, ["scripts/migrate.mjs", "drop", "-f"], { cwd: root, env });
+  step("migrate: up", process.execPath, ["scripts/migrate.mjs", "up"], { cwd: root, env });
+  step("build the API", "go", ["build", "-o", exe, "./cmd/server"], { cwd: join(root, "apps/api") });
+
+  api = spawn(exe, [], {
+    cwd: join(root, "apps/api"),
+    env: { ...env, APP_ENV: "development", APP_PORT: String(port), JWT_SECRET: randomBytes(32).toString("hex") },
+  });
+  let output = "";
+  api.stdout.on("data", (d) => { output += d; });
+  api.stderr.on("data", (d) => { output += d; });
+  const deadline = Date.now() + 20000;
+  for (;;) {
+    if (api.exitCode !== null) throw new Error(`the API exited ${api.exitCode}:\n${output}`);
+    try {
+      if ((await fetch(`${base}/api/v1/health`)).ok) break;
+    } catch {}
+    if (Date.now() > deadline) throw new Error(`the API did not answer on :${port}:\n${output}`);
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  console.log("checks");
+  await checks(call);
+} catch (err) {
+  failed++;
+  console.error(`smoke: ${err.message}`);
+} finally {
+  api?.kill();
+  await new Promise((r) => setTimeout(r, 300));
+  rmSync(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 300 });
+}
+console.log(failed ? `smoke: ${failed} failed` : "smoke: all checks passed");
+process.exit(failed ? 1 : 0);

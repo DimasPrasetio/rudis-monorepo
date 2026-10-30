@@ -47,7 +47,7 @@ func Load() (*Config, error) {
 	}
 	c.Location = loc
 	if c.DBDSN == "" {
-		return nil, errors.New("DB_DSN is not set — copy .env.example to .env at the repo root")
+		return nil, errors.New("DB_DSN is not set — locally, run node scripts/db-local.mjs (it fills .env at the repo root); on a server, set it in the app folder's .env (knowledge/DEPLOYMENT.md)")
 	}
 	if c.Env != "development" && c.Env != "production" {
 		return nil, fmt.Errorf("APP_ENV must be development or production (got %q)", c.Env)

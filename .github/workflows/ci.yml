@@ -21,6 +21,7 @@ jobs:
         with:
           node-version: 22
       - run: node scripts/check-drift.mjs
+      - run: node --test scripts/generated-scripts.test.mjs
       - run: node scripts/package.mjs --check
       # Every change to what a project or the references contain is a tagged kernel release —
       # what the module library pins (the post-commit hook tags; push with --follow-tags).
