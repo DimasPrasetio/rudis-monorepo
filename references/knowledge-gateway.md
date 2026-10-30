@@ -17,9 +17,11 @@ over time*:
 | Consolidated — changes with the project, read every session | `knowledge/` |
 | Decision — barely changes, binding, tracked | `knowledge/decisions/` |
 | Operational rule — enforced while editing code | `.claude/rules/` |
-| Per-task artifact — accumulates, never re-edited | `analysis/` |
+| Per-task artifact — accumulates, never re-edited | `analysis/`; RUDIS SDD specs in `specs/` (edited until merged into the main branch, then frozen) |
 
-Four axes, zero overlap — a document has exactly one time property.
+Four axes, zero overlap — a document has exactly one time property. A RUDIS SDD spec is a per-task
+artifact whose task is still running; RUDIS's other output folders are tool-owned, not a rack
+([RUDIS SDD output](#rudis-sdd-output)).
 
 If a project later genuinely needs a stakeholder-facing document, it may come back — but as a
 **derived** document generated from `knowledge/`, never as a second parallel source. Designing
@@ -122,8 +124,13 @@ always a finding to raise, never a choice to make silently:
 2. This monorepo standard + .claude/rules/
 3. Code, config, active migrations
 4. knowledge/*
-5. AI observations & hypotheses
+5. RUDIS SDD records — specs/ and the other RUDIS output
+6. AI observations & hypotheses
 ```
+
+A spec under `specs/` is a task's plan of change. While that task runs, where it differs from
+code and `knowledge/` is the planned change, not a conflict. Once merged it is a frozen record,
+and the owner wins.
 
 ### `MODULE_MAP.md`
 
@@ -143,6 +150,41 @@ giving `MODULE_MAP.md` a fast, module-scoped lookup for boundary checks.
 Per-requirement analysis artifacts, one folder per requirement — `analysis/<id>/analysis.md`
 plus diagrams. Committed on purpose, and never edited after being written (a changed
 understanding gets a new folder). See `analysis/README.md` in the generated project.
+
+## RUDIS SDD output
+
+A custom module — an assembly-table row decided **build** or **install + adapt**
+([module-library.md](module-library.md)) — may be specified with RUDIS SDD (CLI `rudis`,
+commands `/rudis.*`). RUDIS writes to fixed locations of its own, and the standard keeps them
+rather than moving them; `.claude/rules/monorepo.md` in the generated project lists each one and
+whether it is committed. This section is why.
+
+- **Keep RUDIS's paths.** Its scripts and commands hard-code them (`specs/` at the repo root,
+  `.rudis/`, the `docs/` subfolders each command writes). Moving them would mean patching every
+  RUDIS release; naming them in one rule is cheaper and keeps them out of `knowledge/`'s job.
+- **A spec moves to its owners, then freezes.** While its task runs the spec is the plan, edited by
+  clarify, plan, and tasks. A contract or table left only in `specs/` would be a second home, so
+  before handover each fact moves to its owner (`packages/api-contract/`, `knowledge/API.md`,
+  `knowledge/DATABASE.md`, `knowledge/MODULE_MAP.md`), and once merged the copy left behind is
+  history with a pointer — the same "never re-edited" property as `analysis/`. The pointer is a
+  separate `FROZEN.md` because contract files are often YAML or JSON, where a heading line would
+  break them. RUDIS commands that amend earlier artifacts (redesign, revamp, upgrade, postmortem)
+  send the change to the owner or a new spec instead, so history stays history.
+- **Names are fixed before the spec exists.** `analysis.md` is written first and never edited, so
+  the row's `<NNN>-<slug>` is chosen there and handed to `/rudis.specify`; the link is right from
+  the start instead of patched in later.
+- **The constitution points, it does not restate.** Plans are checked against
+  `.rudis/memory/constitution.md`, so it must carry the standard — but a rule written out there
+  would be a copy that drifts. A short MUST naming its owner gives the check without the copy.
+- **`docs/brd/` is derived, never an owner.** `/rudis.brd` describes entities, API surface, and
+  dependencies per module — facts `knowledge/` already owns. It is kept as a regenerated view,
+  like the stakeholder document above, so it can never win a disagreement.
+- **Run output stays out of git.** Trace and test reports can quote production data or security
+  findings, and audit logs are per-run noise; they are gitignored rather than reviewed for leaks
+  on every commit.
+- **`CLAUDE.md` stays a gateway.** `/rudis.plan` runs an agent-context update that appends
+  "Active Technologies" and "Recent Changes" to `CLAUDE.md`; that is exactly the always-loaded
+  growth this standard prevents, so the rule says to skip or revert it.
 
 ## `.claude/rules/`
 

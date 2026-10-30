@@ -234,6 +234,12 @@ apps/api/tmp/
 apps/api/data/
 # Prisma
 apps/api/prisma/*.db
+# RUDIS SDD — run output, never committed (.claude/rules/monorepo.md)
+docs/trace-reports/
+docs/test-reports/
+.rudis/audit.log
+.rudis/audit/
+.rudis/.current-feature
 `);
 
 // LF everywhere: a Windows checkout with core.autocrlf would otherwise make every file look
@@ -330,6 +336,8 @@ npm run dev:api
   starting at \`knowledge/INDEX.md\`
 - \`.claude/rules/\` — path-scoped technical rules
 - \`analysis/\` — per-requirement analysis artifacts (see \`analysis/README.md\`)
+- \`specs/\`, \`.rudis/\` — RUDIS SDD specs and tooling, once a custom module is specified with it
+  (see \`.claude/rules/monorepo.md\`)
 - \`infra/\` — Docker image, host nginx site, and the server deploy files
 - \`.github/workflows/\` — \`ci\` (checks) and \`release-image\` (builds the image to GHCR)
 
@@ -416,10 +424,14 @@ Raise it as a finding instead.
 2. This monorepo standard + \`.claude/rules/\`
 3. Code, config, active migrations
 4. \`knowledge/*\`
-5. AI observations & hypotheses
+5. RUDIS SDD records — \`specs/\` and the other RUDIS output \`.claude/rules/monorepo.md\` names
+6. AI observations & hypotheses
 
 Code shows what **actually happens**, not what **should**.
 If (3) and (4) disagree, that's a conflict to report — not a choice to make on your own.
+A spec under \`specs/\` is a task's plan of change. While that task runs, where it differs from
+code and \`knowledge/\` is the planned change, not a conflict. Once merged it is a frozen record,
+and the owner wins.
 `);
 file("knowledge/PROJECT.md", kStub("Project Brief", "What this project is and why it exists; features, scope, and user stories."));
 file("knowledge/ARCHITECTURE.md", kStub("Architecture", "Apps, modules, data flow, and boundaries."));
@@ -593,6 +605,8 @@ plus shared packages.
 ## Decision
 Adopt the Rudis monorepo standard: apps/, packages/, knowledge/, .claude/rules/, analysis/, infra/.
 \`knowledge/\` is the single knowledge rack — there is no separate \`docs/\` for stakeholders.
+RUDIS SDD output, used to specify custom modules, stays where RUDIS writes it and is never a
+second knowledge rack.
 Enforced while editing by \`.claude/rules/monorepo.md\`.
 
 ## Consequences
@@ -667,7 +681,32 @@ Applies to: whole repository.
 - Frontend and backend start separately (the commands live in \`CLAUDE.md\`). Do not introduce a
   combined \`npm run dev\` or \`concurrently\` unless explicitly requested.
 - \`CLAUDE.md\` carries only the always-loaded invariants; detail belongs in \`knowledge/\`.
-- \`knowledge/\` is the project's only knowledge rack. There is no parallel \`docs/\`.
+- \`knowledge/\` is the project's only knowledge rack. There is no parallel \`docs/\` rack.
+- RUDIS SDD output stays where RUDIS writes it and is never a second knowledge rack:
+  - \`specs/<NNN>-<slug>/\` — one per build or install + adapt row of the assembly table. The row
+    fixes \`<NNN>-<slug>\` (three digits; lowercase \`a-z0-9\` and hyphens) when the analysis is
+    written; pass it as
+    \`/rudis.specify --number <NNN> --short-name <slug>\`. Edited while its task runs. Before
+    handover, its contract, tables, and module rows move to their owners
+    (\`packages/api-contract/\`, \`knowledge/API.md\`, \`DATABASE.md\`, \`MODULE_MAP.md\`), and a
+    \`FROZEN.md\` in the folder records the date and the owner of each moved fact. Once merged into
+    the main branch the folder is frozen: nothing in it is edited again — a changed understanding
+    gets a new spec.
+  - \`/rudis.redesign\`, \`/rudis.revamp\`, \`/rudis.upgrade\`, and \`/rudis.postmortem\` never amend a
+    frozen spec or \`docs/brd/\`: the change goes to its owner (\`packages/api-contract/\`,
+    \`knowledge/\`) or into a new spec, and \`docs/brd/\` is refreshed by re-running \`/rudis.brd\`.
+  - \`.rudis/\` — RUDIS tooling and \`.rudis/memory/constitution.md\`, committed; its run output
+    (\`.rudis/audit.log\`, \`.rudis/audit/\`, \`.rudis/.current-feature\`) is gitignored. Each
+    constitution principle is a short MUST naming the file that owns it, never the rule restated.
+  - \`/rudis.plan\`'s agent-context update (\`update-agent-context.sh\`) never edits \`CLAUDE.md\`:
+    skip it, or revert what it added.
+  - \`docs/brd/\` — derived by \`/rudis.brd\`, only when it is run. Committed, but never an owner:
+    regenerated rather than hand-edited, and on any disagreement code and \`knowledge/\` win.
+  - \`docs/revamp/\`, \`docs/upgrades/\` — records of the \`/rudis.revamp\` or \`/rudis.upgrade\` run
+    that wrote them; committed, not edited after merge.
+  - \`docs/trace-reports/\`, \`docs/test-reports/\` — gitignored: they can quote production data or
+    security findings.
+  - Nothing else goes under \`docs/\`.
 - Every fact has one owner. Before writing a fact into a second file, check whether the file
   that already owns it should be updated instead — and if a summary really is needed, name the
   authoritative file next to it.
@@ -818,6 +857,9 @@ was, for future-you and for the next Claude session. Do not gitignore it.
 
 Artifacts here are never edited after being written. If understanding changes, write a new
 analysis — don't rewrite the old one.
+
+A build or install + adapt row specified with RUDIS SDD names its \`specs/<NNN>-<slug>/\` folder
+in \`analysis.md\` when the analysis is written, and links to it rather than copying the spec.
 `);
 
 // ---------------------------------------------------------------------------

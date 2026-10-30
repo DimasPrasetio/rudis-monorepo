@@ -110,6 +110,8 @@ project-name/
 │   ├── shared/               # truly reusable cross-app code only
 │   └── api-contract/         # OpenAPI/schema/API contract docs
 ├── analysis/                 # per-requirement analysis artifacts (see analysis/README.md)
+├── specs/                    # RUDIS SDD: one folder per build / install + adapt row (frozen once merged into main)
+├── .rudis/                   # RUDIS SDD tooling + project constitution (see knowledge-gateway.md)
 ├── infra/
 │   ├── docker/               # Dockerfile — the one image (web + api)
 │   ├── deploy/               # server files: docker-compose.prod.yml, deploy.sh, .env.production.example
@@ -176,6 +178,11 @@ already owns it instead — a helpful-looking copy is how two files end up both 
 authoritative and quietly disagreeing. Full rules, the ownership table, and why two racks were
 rejected: [references/knowledge-gateway.md](references/knowledge-gateway.md).
 
+A custom module specified with RUDIS SDD keeps RUDIS's own output locations (`specs/`, `.rudis/`,
+a few `docs/` subfolders). None is a second knowledge rack: the generated
+`.claude/rules/monorepo.md` lists each one and whether it is committed, and
+[references/knowledge-gateway.md](references/knowledge-gateway.md#rudis-sdd-output) says why.
+
 ## Anti-Overengineering Rules
 
 Do not use by default unless explicitly requested: Microservices, Kubernetes, Turborepo complexity, Nx, Redis, Memcache, TanStack libraries, multiple frontend containers, separate backend/frontend production containers, Dockerized database, cross-module foreign keys, cross-module joins, GORM (or GORM AutoMigrate) for Go.
@@ -204,7 +211,8 @@ Before delivering the structure or changing code, verify:
 - Image non-root with `ENTRYPOINT` and a `/readyz` HEALTHCHECK? `deploy.sh` backs up the DB before migrating?
 - `.claude/rules/deployment.md` and `knowledge/DEPLOYMENT.md` present, with no secret committed anywhere?
 - `.env.example` present, with no real secrets?
-- `knowledge/` matches the new file list, with no parallel `docs/` directory?
+- `knowledge/` matches the new file list, with no parallel `docs/` rack (only the RUDIS SDD output folders `.claude/rules/monorepo.md` lists)?
+- RUDIS SDD in use: each `specs/<NNN>-<slug>/` named in its `analysis.md`, its contracts and tables moved to their owners with a `FROZEN.md` before handover, and the folder frozen once merged into main?
 - `knowledge/SOURCE_PRIORITY.md` present?
 - Every fact has one owner — no rule text copied between `.claude/rules/` files, no rule
   restated inside `knowledge/`, ADRs recording *why* rather than repeating *what*?
