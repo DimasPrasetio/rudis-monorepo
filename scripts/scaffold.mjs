@@ -337,7 +337,7 @@ Monorepo generated to the Rudis standard (modular-monolith backend + React 19 fr
 ## Development
 
 \`.env\` (gitignored) already holds local values that work — a random \`JWT_SECRET\`, and the
-local sign-in \`admin@gmail.com\` / \`admin123\` once a module needs one; \`node scripts/env-local.mjs\`
+local sign-in \`admin@example.com\` / \`admin123\` once a module needs one; \`node scripts/env-local.mjs\`
 adds what \`.env.example\` gains later. The API needs its databases once: this creates
 \`${dbName}\` and \`${testDbName}\` with one account that may use only those two, and writes
 \`${dbKeys[0]}\` and \`${dbKeys[1]}\` to \`.env\`. It asks your MySQL admin password (hidden,
@@ -1224,9 +1224,10 @@ perm="$(stat -c %a .env 2>/dev/null || stat -f %Lp .env)"
 [ "$(envval APP_ENV)" = "production" ] || { echo "  ✗ APP_ENV in .env must be production"; exit 1; }
 # The local sign-in scripts/env-local.mjs writes on a developer's machine never runs here — in
 # any form docker compose still reads (quotes, export, spaces, a trailing comment, any case).
-local_signin='^[[:space:]]*(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*[[:space:]]*=[[:space:]]*["'"'"']?(admin@gmail[.]com|admin123)["'"'"']?([[:space:]]+#.*)?[[:space:]]*$'
+# admin@gmail.com is the email older projects' env-local.mjs wrote.
+local_signin='^[[:space:]]*(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*[[:space:]]*=[[:space:]]*["'"'"']?(admin@(example|gmail)[.]com|admin123)["'"'"']?([[:space:]]+#.*)?[[:space:]]*$'
 if grep -qiE "$local_signin" .env; then
-  echo "  ✗ .env holds the local sign-in (admin@gmail.com / admin123) — give this server its own values"; exit 1
+  echo "  ✗ .env holds the local sign-in (admin@example.com or admin@gmail.com / admin123) — give this server its own values"; exit 1
 fi
 DB_NAME="$(envval DB_NAME)"
 [ -n "$DB_NAME" ] || { echo "  ✗ DB_NAME is empty in .env"; exit 1; }

@@ -152,7 +152,7 @@ What it must keep (the drift check asserts these):
 `cd ~/<slug> && ./deploy.sh <git-sha>`:
 
 0. **preflight** — no placeholder markers left; `.env` exists and is `chmod 600`;
-   `APP_ENV=production`; no value is the local sign-in (`admin@gmail.com`, `admin123` —
+   `APP_ENV=production`; no value is the local sign-in (`admin@example.com`, the old `admin@gmail.com`, `admin123` —
    [local-database.md](local-database.md#env-runs-as-soon-as-it-is-written)); `DB_NAME` set
    (warns when it isn't `<slug>_db`).
 1. **pull** `ghcr.io/<owner>/<repo>:<git-sha>` (`latest` is refused — it can't be rolled back to),

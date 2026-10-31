@@ -15,7 +15,7 @@ It never changes a value already set; an empty or placeholder one (`change-me`, 
 | Key | Local value |
 |---|---|
 | `*_SECRET` (`JWT_SECRET`) | 64 random hex characters |
-| `*BOOTSTRAP*EMAIL` (`USERS_BOOTSTRAP_EMAIL`, `RBAC_BOOTSTRAP_ADMIN_EMAIL`) | `admin@gmail.com` |
+| `*BOOTSTRAP*EMAIL` (`USERS_BOOTSTRAP_EMAIL`, `RBAC_BOOTSTRAP_ADMIN_EMAIL`) | `admin@example.com` |
 | `*BOOTSTRAP*PASSWORD` | `admin123` |
 | `*BOOTSTRAP*NAME` | `admin` |
 | the database keys | left to `db-local.mjs` (below); one with a placeholder anywhere in it (`__ISI_USER__:__ISI_SANDI__@tcp(…)/app_db`, `DB_USER=__ISI_USER__`) is emptied, and `db-local.mjs` does not count it as another account |
