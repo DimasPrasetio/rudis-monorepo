@@ -7,7 +7,7 @@
 //
 // A value already in .env is never changed. An empty or placeholder value gets:
 //   *_SECRET (not *_CLIENT_SECRET)    a random 64-character hex value
-//   *BOOTSTRAP*EMAIL / *PASSWORD / *NAME   the local sign-in: admin@gmail.com / admin123 / admin
+//   *BOOTSTRAP*EMAIL / *PASSWORD / *NAME   the local sign-in: admin@example.com / admin123 / admin
 //   anything else                     the value .env.example gives (empty = the module's default)
 // __KEY_MAIN__ and __KEY_TEST__ stay empty here: node scripts/db-local.mjs fills them.
 // The database keys db-local.mjs writes are emptied when a placeholder is anywhere in them
@@ -21,7 +21,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 /** The local sign-in, the same in every project. Never used outside a developer's machine. */
-export const LOCAL_SIGN_IN = { email: "admin@gmail.com", password: "admin123", name: "admin" };
+export const LOCAL_SIGN_IN = { email: "admin@example.com", password: "admin123", name: "admin" };
 const DB_KEYS = ["__KEY_MAIN__", "__KEY_TEST__"];
 // A value nobody can run with: an empty marker left for a person to fill.
 const PLACEHOLDER = /^(change-?me\b.*|__[A-Z0-9_]+__|<[^<>]*>)$/i;

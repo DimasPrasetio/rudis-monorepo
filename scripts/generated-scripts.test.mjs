@@ -81,7 +81,7 @@ test("scaffold writes .env with local values that work — no placeholder, DB ke
   assert.match(readFileSync(join(projects.go, ".gitignore"), "utf8"), /^\.env$/m);
 });
 
-test("env-local: keys a module adds get local values; the local sign-in is admin@gmail.com / admin123", () => {
+test("env-local: keys a module adds get local values; the local sign-in is admin@example.com / admin123", () => {
   // A copy: the shared projects stay as scaffolded for the other tests.
   const dir = join(scratch, "env-local");
   cpSync(projects.go, dir, { recursive: true, filter: (src) => !src.includes("node_modules") });
@@ -95,10 +95,10 @@ test("env-local: keys a module adds get local values; the local sign-in is admin
   const r = node(["scripts/env-local.mjs"], { cwd: dir });
   assert.equal(r.status, 0, r.stderr);
   const env = envOf(readFileSync(join(dir, ".env"), "utf8"));
-  assert.equal(env.USERS_BOOTSTRAP_EMAIL, "admin@gmail.com");
+  assert.equal(env.USERS_BOOTSTRAP_EMAIL, "admin@example.com");
   assert.equal(env.USERS_BOOTSTRAP_PASSWORD, "admin123");
   assert.equal(env.USERS_BOOTSTRAP_NAME, "admin");
-  assert.equal(env.RBAC_BOOTSTRAP_ADMIN_EMAIL, "admin@gmail.com");
+  assert.equal(env.RBAC_BOOTSTRAP_ADMIN_EMAIL, "admin@example.com");
   assert.equal(env.AUDIT_RETENTION_DAYS, "", "an optional key keeps the module default");
   assert.equal(env.APP_PORT, "9191", "a value somebody set is never changed");
   assert.match(env.JWT_SECRET, /^[0-9a-f]{64}$/);
@@ -115,7 +115,7 @@ test("env-local: keys a module adds get local values; the local sign-in is admin
   assert.equal(node(["scripts/env-local.mjs"], { cwd: dir }).status, 0);
   const crlf = readFileSync(join(dir, ".env"), "utf8");
   assert.ok(!/[^\r]\n/.test(crlf) && !crlf.includes("\r\r"), "CRLF kept");
-  assert.equal(envOf(crlf).USERS_BOOTSTRAP_EMAIL, "admin@gmail.com");
+  assert.equal(envOf(crlf).USERS_BOOTSTRAP_EMAIL, "admin@example.com");
   assert.equal(envOf(crlf).USERS_BOOTSTRAP_PASSWORD, "admin123");
 
   // The inventory .env's database keys: a placeholder anywhere in them empties them for
@@ -184,7 +184,7 @@ test("env-local: keys a module adds get local values; the local sign-in is admin
 
 test("the local sign-in never reaches a server: not in .env.production.example, refused by deploy.sh", () => {
   for (const [backend, dir] of Object.entries(projects)) {
-    assert.doesNotMatch(readFileSync(join(dir, "infra/deploy/.env.production.example"), "utf8"), /admin@gmail|admin123/, backend);
+    assert.doesNotMatch(readFileSync(join(dir, "infra/deploy/.env.production.example"), "utf8"), /admin@(example|gmail)|admin123/, backend);
   }
   // The check exactly as deploy.sh runs it: its pattern line, then its grep.
   const deploy = readFileSync(join(projects.go, "infra/deploy/deploy.sh"), "utf8");
@@ -195,12 +195,17 @@ test("the local sign-in never reaches a server: not in .env.production.example, 
     writeFileSync(join(scratch, "server.env"), `APP_ENV=production\n${line}\n`);
     return spawnSync("bash", ["check.sh"], { cwd: scratch }).status === 0;
   };
-  for (const line of ["USERS_BOOTSTRAP_EMAIL=admin@gmail.com", "USERS_BOOTSTRAP_PASSWORD=admin123",
-    'RBAC_BOOTSTRAP_ADMIN_EMAIL="admin@gmail.com"', "USERS_BOOTSTRAP_PASSWORD=admin123\r",
+  // admin@gmail.com: what older projects' env-local.mjs wrote.
+  for (const line of ["USERS_BOOTSTRAP_EMAIL=admin@example.com", "USERS_BOOTSTRAP_PASSWORD=admin123",
+    'RBAC_BOOTSTRAP_ADMIN_EMAIL="admin@example.com"', "USERS_BOOTSTRAP_PASSWORD=admin123\r",
     "USERS_BOOTSTRAP_PASSWORD='admin123'", "export USERS_BOOTSTRAP_PASSWORD=admin123",
-    "USERS_BOOTSTRAP_PASSWORD = admin123 # local", "  USERS_BOOTSTRAP_EMAIL=Admin@Gmail.com"]) assert.ok(refuses(line), line);
+    "USERS_BOOTSTRAP_PASSWORD = admin123 # local", "  USERS_BOOTSTRAP_EMAIL=Admin@Example.com",
+    "USERS_BOOTSTRAP_EMAIL=admin@gmail.com", 'RBAC_BOOTSTRAP_ADMIN_EMAIL="admin@gmail.com"',
+    "  USERS_BOOTSTRAP_EMAIL=Admin@Gmail.com"]) assert.ok(refuses(line), line);
   for (const line of ["USERS_BOOTSTRAP_EMAIL=owner@tokomaju.com", "USERS_BOOTSTRAP_PASSWORD=admin1234",
-    "# USERS_BOOTSTRAP_EMAIL=admin@gmail.com", "USERS_BOOTSTRAP_EMAIL="]) assert.ok(!refuses(line), line);
+    "USERS_BOOTSTRAP_EMAIL=admin@example.co.id", "USERS_BOOTSTRAP_EMAIL=superadmin@example.com",
+    "# USERS_BOOTSTRAP_EMAIL=admin@example.com", "# USERS_BOOTSTRAP_EMAIL=admin@gmail.com",
+    "USERS_BOOTSTRAP_EMAIL="]) assert.ok(!refuses(line), line);
 });
 
 test("db-local --admin-password-empty never reuses what exists: the guard, with no database", async () => {
