@@ -51,7 +51,9 @@ Paginated:
 
 ## Config and environment standard
 
-Always create `.env.example`. Never create real `.env` files containing secrets.
+Always create `.env.example`, with no secret in it. `.env` (gitignored) holds local values
+only — written by `scripts/env-local.mjs` and `scripts/db-local.mjs`
+([local-database.md](local-database.md)); never a server's secret.
 
 Minimum variables:
 
@@ -62,7 +64,7 @@ APP_NAME=app-name
 
 DB_HOST=localhost
 DB_PORT=3306
-DB_USER=root
+DB_USER=
 DB_PASSWORD=
 DB_NAME=app_db
 

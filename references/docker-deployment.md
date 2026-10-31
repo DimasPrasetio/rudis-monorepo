@@ -111,7 +111,7 @@ services:
       dockerfile: infra/docker/Dockerfile
     ports:
       - "8080:8080"
-    # Copy .env.example to .env before running compose.
+    # .env holds local values (scripts/env-local.mjs + db-local.mjs write it).
     env_file:
       - .env
     extra_hosts:
@@ -152,7 +152,9 @@ What it must keep (the drift check asserts these):
 `cd ~/<slug> && ./deploy.sh <git-sha>`:
 
 0. **preflight** — no placeholder markers left; `.env` exists and is `chmod 600`;
-   `APP_ENV=production`; `DB_NAME` set (warns when it isn't `<slug>_db`).
+   `APP_ENV=production`; no value is the local sign-in (`admin@gmail.com`, `admin123` —
+   [local-database.md](local-database.md#env-runs-as-soon-as-it-is-written)); `DB_NAME` set
+   (warns when it isn't `<slug>_db`).
 1. **pull** `ghcr.io/<owner>/<repo>:<git-sha>` (`latest` is refused — it can't be rolled back to),
    then check `.env` against the image's own copy of `.env.production.example`: every key must be
    present, and one whose example value is `<…>` must be filled. Nothing has changed yet when it

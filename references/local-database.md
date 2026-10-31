@@ -1,21 +1,55 @@
 # Local database
 
-How a project gets its MySQL databases on a developer's machine, which account plugin to use,
-and how scripts that rebuild a database are kept from rebuilding the wrong one. Server
-databases and accounts are in [docker-deployment.md](docker-deployment.md).
+How a project gets a `.env` that runs and its MySQL databases on a developer's machine, which
+account plugin to use, and how scripts that rebuild a database are kept from rebuilding the
+wrong one. Server databases and accounts are in [docker-deployment.md](docker-deployment.md).
 
-## One command, run by the developer
+## `.env` runs as soon as it is written
+
+The scaffold writes `.env` (gitignored) next to `.env.example` with values that work on a
+developer's machine, through `scripts/env-local.mjs` (every backend). Run it again after each
+`module.mjs add`: the module's keys reach `.env.example`, and this gives them local values.
+It never changes a value already set; an empty or placeholder one (`change-me`, `__X__`,
+`<x>`) gets:
+
+| Key | Local value |
+|---|---|
+| `*_SECRET` (`JWT_SECRET`) | 64 random hex characters |
+| `*BOOTSTRAP*EMAIL` (`USERS_BOOTSTRAP_EMAIL`, `RBAC_BOOTSTRAP_ADMIN_EMAIL`) | `admin@gmail.com` |
+| `*BOOTSTRAP*PASSWORD` | `admin123` |
+| `*BOOTSTRAP*NAME` | `admin` |
+| the database keys | left to `db-local.mjs` (below) |
+| anything else | the value `.env.example` gives — empty means the module's default |
+
+A placeholder it has no value for is named, and it exits 1. The users module signs in by
+email (there is no user name; `admin` is the display name), and its 8-character minimum
+accepts `admin123`. The local sign-in exists only on developers' machines: the server's `.env`
+is written from `.env.production.example`, which never holds it, and `deploy.sh` refuses a
+`.env` that does.
+
+## One command for the databases
 
 ```bash
-node scripts/db-local.mjs               # asks the MySQL admin password; creates and fills .env
-node scripts/db-local.mjs --print-sql   # the SQL it would run — connects to nothing
+node scripts/db-local.mjs --admin-password-empty   # root without a password (Laragon, XAMPP): asks nothing
+node scripts/db-local.mjs                          # asks the MySQL admin password (hidden)
+node scripts/db-local.mjs --print-sql              # the SQL it would run — connects to nothing
 ```
 
-Every backend gets `scripts/db-local.mjs`. The developer runs it **in their own terminal**: it
-asks the MySQL admin password itself (hidden, never stored), so a password never passes
-through a chat, a brief, or a file in the repo. An agent never runs it for them and never asks
-for the password; it asks the developer to run it, and may run `--print-sql` to show what it
-does.
+Every backend gets `scripts/db-local.mjs`. An agent runs the first form: it signs in as root
+with an empty password, on `localhost` or `127.0.0.1` only (any other `--host` is refused),
+through the same private option file. It stops, changes nothing, and prints one command for
+the developer to run in their own terminal — `node scripts/db-local.mjs`, which asks the
+password itself (hidden, never stored) — when:
+
+| Exit | Why |
+|---|---|
+| 3 | the sign-in failed: root has a password, or no MySQL answers |
+| 4 | `<slug>_db`, `<slug>_test` or `<slug>_dev` already exists. Unattended it never reuses them: a new password for the account would cut off another checkout's `.env`, and a same-named database may belong to something else. Copying `.env` from the checkout that created them is the other way out |
+| 1 | anything else (no `mysql` client, `.env` not ignored by git, keys pointing at another account) — the message says what |
+
+So a password never passes through an agent, a chat, a command line, or a file in the repo; an
+agent never asks for it. The interactive form reuses what exists and gives the account a new
+password — a person's decision.
 
 What it does, in order:
 
@@ -25,17 +59,21 @@ What it does, in order:
    `mysqld.exe` (Laragon, XAMPP and the installers keep it off `PATH`); `PATH`; then
    `Program Files\MySQL|MariaDB\*\bin` — and signs in as `--admin-user` (default `root`)
    through a private, temporary option file, never a command-line password.
-3. Reads `SELECT VERSION()` and picks the account plugin from it (next section).
+3. Reads `SELECT VERSION()` and picks the account plugin from it (next section). With
+   `--admin-password-empty`, stops here (exit 4) when either database or the account exists.
+   Then completes `.env` with `env-local.mjs` (above) — still before anything on the server
+   changes.
 4. Creates `<slug>_db` and `<slug>_test` (`utf8mb4_unicode_ci`) if missing, and the account
    `<slug>_dev@'127.0.0.1'` with a random 36-character password and `ALL PRIVILEGES` on
    those two databases only — nothing global, and the `_` in their names escaped (in a
    database-level `GRANT`, `_` is a wildcard). The password mixes upper and lower case, digits
    and `-`, so `validate_password`'s MEDIUM policy (on in some MySQL packages) accepts it, and
-   needs no escaping in SQL, a DSN, or a URL. Run again, it keeps the data and gives the
-   account a new password.
-5. Writes the two keys to `.env` — the account already has the new password: `DB_DSN` +
-   `TEST_DB_DSN` (Go, `<user>:<password>@tcp(127.0.0.1:<port>)/<db>`) or `DATABASE_URL` +
-   `TEST_DATABASE_URL` (Prisma, `mysql://…`).
+   needs no escaping in SQL, a DSN, or a URL. The asking form run again keeps the data and
+   gives the account a new password.
+5. Writes the two keys to `.env` — the account already has the new password: `DB_DSN` + `TEST_DB_DSN` (Go,
+   `<user>:<password>@tcp(127.0.0.1:<port>)/<db>`) or `DATABASE_URL` + `TEST_DATABASE_URL`
+   (Prisma, `mysql://…`) — and, where `.env` has them, the split
+   `DB_HOST`/`DB_PORT`/`DB_USER`/`DB_PASSWORD`/`DB_NAME`, replaced to name the same account.
 6. Signs in as that account over TCP, as the app will, and checks it sees both databases.
 
 The admin password goes to the client through an option file in a private temporary folder,
@@ -49,7 +87,7 @@ container sees the docker gateway's address instead, and step 6 says so.
 In Git Bash (mintty) Node has no terminal to hide the password in — run it from PowerShell,
 cmd, or a terminal, or prefix `winpty`.
 
-`.env.example` leaves both keys **empty**. A placeholder shaped like a DSN
+`.env.example` — and so `.env` until `db-local.mjs` runs — leaves both keys **empty**. A placeholder shaped like a DSN
 (`root:@tcp(localhost:3306)/app_db`, `__FILL__:__FILL__@tcp(…)`) is a working connection
 string the moment `.env.example` is copied: tools then sign in to whatever MySQL listens on
 3306. Empty fails loudly instead — the Go API refuses to start, `migrate.mjs` says to run
