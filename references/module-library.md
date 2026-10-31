@@ -89,7 +89,8 @@ Event subscriptions a module declares (`listens`) are wired into `registry.go`
 them.
 
 Then, as `add` prints: `npm install` · `cd apps/api && go mod tidy` · `npm run sqlc:generate` ·
-set the required env values in `.env` · `npm run migrate:up` · build and run.
+`node scripts/env-local.mjs` (the new keys get local values in `.env`) · `npm run migrate:up` ·
+build and run.
 
 ### 6. Build what is custom
 

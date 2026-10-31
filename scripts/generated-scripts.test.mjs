@@ -4,10 +4,10 @@
 // (references/local-database.md). Part of npm run verify.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { after, before, test } from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 // Repo-local scratch dir — see the comment in smoke-test.mjs for why this isn't os.tmpdir().
@@ -61,6 +61,133 @@ test("db-local --print-sql: caching_sha2_password on MySQL 8+, the version decid
   }
   assert.doesNotMatch(sql(projects.go, "10.11.6-MariaDB"), /IDENTIFIED WITH/);
   assert.match(sql(projects.nestjs, "8.4.3"), /TEST_DATABASE_URL=mysql:\/\/kasirapp_dev:<password>@127\.0\.0\.1:3306\/kasirapp_test/);
+});
+
+const envOf = (text) => Object.fromEntries(text.split(/\r?\n/)
+  .map((l) => l.match(/^([A-Z0-9_]+)=(.*)$/)).filter(Boolean).map((m) => [m[1], m[2]]));
+const PLACEHOLDER = /^(change-me|__[A-Z0-9_]+__|<[^<>]*>)$/i;
+
+test("scaffold writes .env with local values that work — no placeholder, DB keys left to db-local", () => {
+  for (const [backend, dir] of Object.entries(projects)) {
+    const env = envOf(readFileSync(join(dir, ".env"), "utf8"));
+    const example = envOf(readFileSync(join(dir, ".env.example"), "utf8"));
+    assert.deepEqual(Object.keys(env).sort(), Object.keys(example).sort(), `${backend}: same keys as .env.example`);
+    assert.deepEqual(Object.entries(env).filter(([, v]) => PLACEHOLDER.test(v)), [], `${backend}: placeholder left`);
+    assert.match(env.JWT_SECRET, /^[0-9a-f]{64}$/, `${backend}: JWT_SECRET is random`);
+    const [main, testKey] = backend === "go" ? ["DB_DSN", "TEST_DB_DSN"] : ["DATABASE_URL", "TEST_DATABASE_URL"];
+    assert.equal(env[main], "");
+    assert.equal(env[testKey], "");
+  }
+  assert.match(readFileSync(join(projects.go, ".gitignore"), "utf8"), /^\.env$/m);
+});
+
+test("env-local: keys a module adds get local values; the local sign-in is admin@gmail.com / admin123", () => {
+  // A copy: the shared projects stay as scaffolded for the other tests.
+  const dir = join(scratch, "env-local");
+  cpSync(projects.go, dir, { recursive: true, filter: (src) => !src.includes("node_modules") });
+  const before = readFileSync(join(dir, ".env"), "utf8");
+  // What module.mjs add writes into .env.example (rudis-modules scripts/lib/install.mjs).
+  const added = ["# users", "USERS_BOOTSTRAP_EMAIL=", "USERS_BOOTSTRAP_PASSWORD=", "USERS_BOOTSTRAP_NAME=",
+    "# rbac", "RBAC_BOOTSTRAP_ADMIN_EMAIL=", "# audit-log (default 365)", "AUDIT_RETENTION_DAYS=", "SESSION_IDLE_TIMEOUT="];
+  writeFileSync(join(dir, ".env.example"), readFileSync(join(dir, ".env.example"), "utf8") + added.join("\n") + "\n");
+  // A value somebody set stays; placeholders from an older template are replaced.
+  writeFileSync(join(dir, ".env"), before.replace(/^APP_PORT=.*$/m, "APP_PORT=9191").replace(/^JWT_SECRET=.*$/m, "JWT_SECRET=change-me"));
+  const r = node(["scripts/env-local.mjs"], { cwd: dir });
+  assert.equal(r.status, 0, r.stderr);
+  const env = envOf(readFileSync(join(dir, ".env"), "utf8"));
+  assert.equal(env.USERS_BOOTSTRAP_EMAIL, "admin@gmail.com");
+  assert.equal(env.USERS_BOOTSTRAP_PASSWORD, "admin123");
+  assert.equal(env.USERS_BOOTSTRAP_NAME, "admin");
+  assert.equal(env.RBAC_BOOTSTRAP_ADMIN_EMAIL, "admin@gmail.com");
+  assert.equal(env.AUDIT_RETENTION_DAYS, "", "an optional key keeps the module default");
+  assert.equal(env.APP_PORT, "9191", "a value somebody set is never changed");
+  assert.match(env.JWT_SECRET, /^[0-9a-f]{64}$/);
+
+  // Run again: nothing changes.
+  const once = readFileSync(join(dir, ".env"), "utf8");
+  assert.equal(node(["scripts/env-local.mjs"], { cwd: dir }).status, 0);
+  assert.equal(readFileSync(join(dir, ".env"), "utf8"), once);
+
+  // An inventory-style .env (CRLF, placeholders for a person to fill) is repaired in place.
+  writeFileSync(join(dir, ".env"), once.replace(/\n/g, "\r\n")
+    .replace(/^USERS_BOOTSTRAP_EMAIL=.*$/m, "USERS_BOOTSTRAP_EMAIL=__ISI_EMAIL_PEMILIK__")
+    .replace(/^USERS_BOOTSTRAP_PASSWORD=.*$/m, "USERS_BOOTSTRAP_PASSWORD=__ISI_SANDI_PEMILIK__"));
+  assert.equal(node(["scripts/env-local.mjs"], { cwd: dir }).status, 0);
+  const crlf = readFileSync(join(dir, ".env"), "utf8");
+  assert.ok(!/[^\r]\n/.test(crlf) && !crlf.includes("\r\r"), "CRLF kept");
+  assert.equal(envOf(crlf).USERS_BOOTSTRAP_EMAIL, "admin@gmail.com");
+  assert.equal(envOf(crlf).USERS_BOOTSTRAP_PASSWORD, "admin123");
+
+  // A quoted placeholder with a trailing comment is still a placeholder; of two lines for one
+  // key the first counts (as db-local.mjs reads it).
+  writeFileSync(join(dir, ".env"), once
+    .replace(/^JWT_SECRET=.*$/m, 'JWT_SECRET="change-me" # set me\nJWT_SECRET=mine'));
+  assert.equal(node(["scripts/env-local.mjs"], { cwd: dir }).status, 0);
+  assert.match(readFileSync(join(dir, ".env"), "utf8"), /^JWT_SECRET=[0-9a-f]{64}\nJWT_SECRET=mine$/m);
+
+  // A placeholder nothing knows a local value for: named, exit 1.
+  writeFileSync(join(dir, ".env"), crlf + "SMOKE_DB_DSN=__ISI_USER_MYSQL__\r\n");
+  const unknown = node(["scripts/env-local.mjs"], { cwd: dir });
+  assert.equal(unknown.status, 1);
+  assert.match(unknown.stderr, /SMOKE_DB_DSN/);
+
+  // Run through a symlink or junction (macOS /tmp, a linked folder on Windows): still writes .env.
+  const link = join(scratch, "env-local-link");
+  symlinkSync(dir, link, process.platform === "win32" ? "junction" : "dir");
+  rmSync(join(dir, ".env"));
+  assert.equal(node([join(link, "scripts/env-local.mjs")]).status, 0);
+  assert.match(readFileSync(join(dir, ".env"), "utf8"), /^JWT_SECRET=[0-9a-f]{64}$/m);
+  rmSync(link);
+});
+
+test("the local sign-in never reaches a server: not in .env.production.example, refused by deploy.sh", () => {
+  for (const [backend, dir] of Object.entries(projects)) {
+    assert.doesNotMatch(readFileSync(join(dir, "infra/deploy/.env.production.example"), "utf8"), /admin@gmail|admin123/, backend);
+  }
+  // The check exactly as deploy.sh runs it: its pattern line, then its grep.
+  const deploy = readFileSync(join(projects.go, "infra/deploy/deploy.sh"), "utf8");
+  const assign = deploy.match(/^local_signin=.*admin123.*$/m)?.[0];
+  assert.ok(assign && deploy.includes('grep -qiE "$local_signin" .env'), "deploy.sh checks .env for the local sign-in");
+  writeFileSync(join(scratch, "check.sh"), `${assign}\ngrep -qiE "$local_signin" server.env\n`);
+  const refuses = (line) => {
+    writeFileSync(join(scratch, "server.env"), `APP_ENV=production\n${line}\n`);
+    return spawnSync("bash", ["check.sh"], { cwd: scratch }).status === 0;
+  };
+  for (const line of ["USERS_BOOTSTRAP_EMAIL=admin@gmail.com", "USERS_BOOTSTRAP_PASSWORD=admin123",
+    'RBAC_BOOTSTRAP_ADMIN_EMAIL="admin@gmail.com"', "USERS_BOOTSTRAP_PASSWORD=admin123\r",
+    "USERS_BOOTSTRAP_PASSWORD='admin123'", "export USERS_BOOTSTRAP_PASSWORD=admin123",
+    "USERS_BOOTSTRAP_PASSWORD = admin123 # local", "  USERS_BOOTSTRAP_EMAIL=Admin@Gmail.com"]) assert.ok(refuses(line), line);
+  for (const line of ["USERS_BOOTSTRAP_EMAIL=owner@tokomaju.com", "USERS_BOOTSTRAP_PASSWORD=admin1234",
+    "# USERS_BOOTSTRAP_EMAIL=admin@gmail.com", "USERS_BOOTSTRAP_EMAIL="]) assert.ok(!refuses(line), line);
+});
+
+test("db-local --admin-password-empty never reuses what exists: the guard, with no database", async () => {
+  const dbLocal = await import(pathToFileURL(join(projects.go, "scripts/db-local.mjs")).href);
+  assert.deepEqual(dbLocal.existingTargets(""), [], "nothing there: go ahead");
+  assert.deepEqual(dbLocal.existingTargets("db kasirapp_test\r\n"), ["kasirapp_test"]);
+  assert.deepEqual(dbLocal.existingTargets("db kasirapp_db\ndb kasirapp_test\naccount kasirapp_dev\n"),
+    ["kasirapp_db", "kasirapp_test", "'kasirapp_dev'@'127.0.0.1'"]);
+  assert.deepEqual(dbLocal.existingTargets("db other_db\naccount someone\n"), [], "rows about anything else are ignored");
+  // The query asks exactly about this app's two databases and its account.
+  assert.match(dbLocal.existingSql(), /SCHEMA_NAME IN \('kasirapp_db', 'kasirapp_test'\)/);
+  assert.match(dbLocal.existingSql(), /User = 'kasirapp_dev' AND Host = '127\.0\.0\.1'/);
+  const message = dbLocal.existsMessage(["kasirapp_db"]);
+  assert.match(message, /nothing was changed/);
+  assert.equal(message.match(/^ {2}node scripts\/db-local\.mjs.*$/gm)?.join("|"), "  node scripts/db-local.mjs");
+});
+
+test("db-local --admin-password-empty: this machine only; a failed sign-in changes nothing and names one command", () => {
+  const dir = projects.nestjs;
+  const remote = node(["scripts/db-local.mjs", "--admin-password-empty", "--host", "db.example.com"], { cwd: dir });
+  assert.equal(remote.status, 1);
+  assert.match(remote.stderr, /this machine only/);
+  // A "client" that cannot sign in: node rejects the option file argument, as mysql rejects root.
+  const before = readFileSync(join(dir, ".env"), "utf8");
+  const r = node(["scripts/db-local.mjs", "--admin-password-empty", "--mysql", process.execPath], { cwd: dir });
+  assert.equal(r.status, 3, r.stderr);
+  assert.match(r.stderr, /nothing was changed/);
+  assert.equal(r.stderr.match(/^ {2}node scripts\/db-local\.mjs.*$/gm)?.join("|"), "  node scripts/db-local.mjs");
+  assert.equal(readFileSync(join(dir, ".env"), "utf8"), before);
 });
 
 test("check-migrations: not applicable on the first commit, still strict afterwards", () => {

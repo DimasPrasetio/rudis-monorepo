@@ -1,26 +1,38 @@
 #!/usr/bin/env node
-// Prepares this app's databases on the MySQL of YOUR machine — run it yourself, in a terminal:
+// Prepares this app's databases on the MySQL of THIS machine:
 //
 //   node scripts/db-local.mjs               asks the MySQL admin password (hidden), then creates
 //                                           __DB_MAIN__ and __DB_TEST__ and one account with rights on
 //                                           those two only, and writes __KEY_MAIN__ and __KEY_TEST__
-//                                           to .env (gitignored)
+//                                           to .env (gitignored) — run it in your own terminal
+//   node scripts/db-local.mjs --admin-password-empty
+//                                           the same without asking: signs in as root with NO
+//                                           password (the Laragon / XAMPP default), localhost only.
+//                                           What an agent runs. It changes nothing and names the one
+//                                           command to run instead when that sign-in fails (exit 3)
+//                                           or when __DB_MAIN__, __DB_TEST__ or the account already
+//                                           exist (exit 4) — it never reuses them or resets a password
 //   node scripts/db-local.mjs --print-sql   prints the SQL it would run; connects to nothing
 //
 // Options: --admin-user root  --host localhost  --port 3306  --mysql <path to the mysql client>
 //          --replace (overwrite __KEY_MAIN__/__KEY_TEST__ in .env that point elsewhere)
 //          --server-version 8.4 (with --print-sql: the server to write the SQL for)
 //
+// .env is created or completed with local values first (scripts/env-local.mjs), so after this
+// one command the app runs.
+//
 // The server version is read first (SELECT VERSION()): MySQL 8.0+ gets caching_sha2_password,
 // its default — mysql_native_password is disabled in 8.4 and gone in 9.x (Error 1524).
-// The account's password is random, never printed, and lives only in .env. Running it again
-// is safe: databases are kept, the account gets a new password and .env is updated with it.
+// The account's password is random, never printed, and lives only in .env. Running the asking
+// form again is safe: databases are kept, the account gets a new password and .env is updated
+// with it. --admin-password-empty stops instead (exit 4).
 import { spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { chmodSync, copyFileSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { fillLocalEnv } from "./env-local.mjs";
 
 const APP = "__SLUG__";
 const DATABASES = ["__DB_MAIN__", "__DB_TEST__"];
@@ -33,17 +45,22 @@ const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const ENV_FILE = join(root, ".env");
 
 function parseArgs(argv) {
-  const opts = { adminUser: "root", host: "localhost", port: "3306", mysql: null, printSql: false, replace: false, serverVersion: "8.4" };
+  const opts = { adminUser: "root", host: "localhost", port: "3306", mysql: null, printSql: false, replace: false, serverVersion: "8.4", emptyPassword: false };
   const valued = { "--admin-user": "adminUser", "--host": "host", "--port": "port", "--mysql": "mysql", "--server-version": "serverVersion" };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--print-sql") opts.printSql = true;
     else if (a === "--replace") opts.replace = true;
+    else if (a === "--admin-password-empty") opts.emptyPassword = true;
     else if (a === "--help" || a === "-h") opts.help = true;
     else if (valued[a] && argv[i + 1] !== undefined) opts[valued[a]] = argv[++i];
     else fail(`unknown option ${a} — see node scripts/db-local.mjs --help`);
   }
   if (!/^\d+$/.test(opts.port)) fail(`--port must be a number (got ${opts.port})`);
+  // Without a prompt nobody sees where it connects: this machine's MySQL only.
+  if (opts.emptyPassword && !["localhost", "127.0.0.1"].includes(opts.host)) {
+    fail(`--admin-password-empty works on this machine only (--host localhost or 127.0.0.1, got ${opts.host})`);
+  }
   return opts;
 }
 
@@ -71,6 +88,30 @@ function setupSql(auth, password) {
     // Last: an existing account's password changes only once everything before it worked.
     `ALTER USER ${account} ${auth.clause} '${password}';`,
   ].join("\n") + "\n";
+}
+
+/** One row per database or account of this app that already exists: "db <name>" / "account <user>". */
+export function existingSql() {
+  return `SELECT CONCAT('db ', SCHEMA_NAME) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME IN (${DATABASES.map((d) => `'${d}'`).join(", ")})` +
+    ` UNION ALL SELECT CONCAT('account ', User) FROM mysql.user WHERE User = '${ACCOUNT.user}' AND Host = '${ACCOUNT.host}'`;
+}
+
+/**
+ * Without a person at the keyboard nothing that exists is reused: the account's password would
+ * change under another checkout's .env, and a same-named database of something else would get
+ * this app's migrations. Returns what exists (empty: go ahead).
+ */
+export function existingTargets(rows) {
+  const found = rows.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  const names = new Set([...DATABASES.map((d) => `db ${d}`), `account ${ACCOUNT.user}`]);
+  return found.filter((r) => names.has(r)).map((r) => (r.startsWith("db ") ? r.slice(3) : `'${ACCOUNT.user}'@'${ACCOUNT.host}'`));
+}
+
+/** The message --admin-password-empty stops with (exit 4) when existingTargets found something. */
+export function existsMessage(existing) {
+  return `db-local: ${existing.join(", ")} already ${existing.length === 1 ? "exists" : "exist"} on this MySQL — nothing was changed. ` +
+    `--admin-password-empty never reuses them or changes the account's password: another checkout's .env may use it.\n\n` +
+    `Copy .env from the checkout that set them up, or run this in your own terminal (it gives the account a new password — update that .env too):\n  node scripts/db-local.mjs`;
 }
 
 /**
@@ -114,14 +155,18 @@ function checkEnvFile(replace) {
   if (foreign.length) fail(`${foreign.join(" and ")} in .env already point at another account — rerun with --replace to overwrite.`);
 }
 
-function writeEnv(values) {
-  if (!existsSync(ENV_FILE)) copyFileSync(join(root, ".env.example"), ENV_FILE);
+/** `values` are always written; `ifPresent` only replaces keys .env already has. */
+function writeEnv(values, ifPresent = {}) {
   let text = readFileSync(ENV_FILE, "utf8");
   const eol = text.includes("\r\n") ? "\r\n" : "\n";
   for (const [key, value] of Object.entries(values)) {
     const line = envLine(key);
     if (line.test(text)) text = text.replace(line, () => `${key}=${value}`);
     else text += `${text.endsWith(eol) || text === "" ? "" : eol}${key}=${value}${eol}`;
+  }
+  for (const [key, value] of Object.entries(ifPresent)) {
+    const line = envLine(key);
+    if (line.test(text)) text = text.replace(line, () => `${key}=${value}`);
   }
   writeFileSync(ENV_FILE, text);
   try { chmodSync(ENV_FILE, 0o600); } catch {}
@@ -224,44 +269,77 @@ function askHidden(question) {
 
 // --- main ---------------------------------------------------------------------------------
 
-const opts = parseArgs(process.argv.slice(2));
-if (opts.help) {
-  const header = readFileSync(fileURLToPath(import.meta.url), "utf8").split(/\r?\n/).slice(1);
-  console.log(header.slice(0, header.findIndex((l) => !l.startsWith("//"))).map((l) => l.replace(/^\/\/ ?/, "")).join("\n"));
-  process.exit(0);
+// Imported (by its tests), the file only defines; run, it does the work.
+// Real paths on both sides: run through a symlink or junction, argv[1] is not the file's path.
+const isMain = process.argv[1] !== undefined && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+if (isMain) {
+  const opts = parseArgs(process.argv.slice(2));
+  if (opts.help) {
+    const header = readFileSync(fileURLToPath(import.meta.url), "utf8").split(/\r?\n/).slice(1);
+    console.log(header.slice(0, header.findIndex((l) => !l.startsWith("//"))).map((l) => l.replace(/^\/\/ ?/, "")).join("\n"));
+    process.exit(0);
+  }
+
+  if (opts.printSql) {
+    const auth = authFor(opts.serverVersion);
+    console.log(`-- ${DATABASES.join(" + ")} and '${ACCOUNT.user}'@'${ACCOUNT.host}' on server ${opts.serverVersion} (${auth.plugin}).`);
+    console.log("-- Nothing was run. <password> is random (36 characters: letters, digits, \"-\"), written only to .env.");
+    process.stdout.write(setupSql(auth, "<password>"));
+    console.log(`-- .env:\n${KEYS.map((k, i) => `-- ${k}=${dsnFor(DATABASES[i], "<password>", opts.port)}`).join("\n")}`);
+    process.exit(0);
+  }
+
+  checkEnvFile(opts.replace);
+  const client = findClient(opts.mysql);
+  const adminPassword = opts.emptyPassword
+    ? ""
+    : await askHidden(`MySQL password for ${opts.adminUser}@${opts.host}:${opts.port} (not shown, not saved): `);
+  const admin = { user: opts.adminUser, password: adminPassword, host: opts.host, port: opts.port };
+
+  const probe = mysql(client, admin, ["-N", "-B", "-e", "SELECT VERSION()"]);
+  if (probe.status !== 0 && opts.emptyPassword) {
+    // An admin with a password, or no MySQL listening: nothing was changed. The person runs the
+    // asking form themselves — the password never goes through an agent, a chat, or a file.
+    const why = (probe.stderr || probe.stdout || "").trim().split(/\r?\n/)[0];
+    console.error(`db-local: could not sign in to MySQL at ${opts.host}:${opts.port} as ${opts.adminUser} without a password — nothing was changed.\n  ${why}\n\nRun this in your own terminal (it asks the MySQL password, hidden):\n  node scripts/db-local.mjs`);
+    process.exit(3);
+  }
+  if (probe.status !== 0) fail(`could not sign in as ${opts.adminUser}:\n${probe.stderr.trim()}`);
+  const version = probe.stdout.trim();
+  const auth = authFor(version);
+  console.log(`MySQL server ${version} → account plugin: ${auth.plugin}`);
+
+  if (opts.emptyPassword) {
+    const rows = mysql(client, admin, ["-N", "-B", "-e", existingSql()]);
+    if (rows.status !== 0) fail(`could not check what already exists:\n${rows.stderr.trim()}`);
+    const existing = existingTargets(rows.stdout);
+    if (existing.length) {
+      console.error(existsMessage(existing));
+      process.exit(4);
+    }
+  }
+
+  // .env completed with local values before the account changes, so a failure here leaves the
+  // server as it was — and after this one command the app runs.
+  const env = fillLocalEnv(root);
+  const password = newPassword();
+  const setup = mysql(client, admin, [], setupSql(auth, password));
+  if (setup.status !== 0) fail(`the setup SQL failed — no database key was written to .env:\n${setup.stderr.trim()}`);
+  // The account now has this password: .env gets it before anything else can fail.
+  writeEnv(
+    Object.fromEntries(KEYS.map((k, i) => [k, dsnFor(DATABASES[i], password, opts.port)])),
+    // The split form, where .env.example lists it, names the same account — never root.
+    { DB_HOST: ACCOUNT.host, DB_PORT: opts.port, DB_USER: ACCOUNT.user, DB_PASSWORD: password, DB_NAME: DATABASES[0] },
+  );
+
+  // Sign in as the new account, over TCP like the app does, and see both databases.
+  const app = { user: ACCOUNT.user, password, host: ACCOUNT.host, port: opts.port };
+  const check = mysql(client, app, ["--protocol=TCP", "-N", "-B", "-e",
+    `SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME IN (${DATABASES.map((d) => `'${d}'`).join(", ")})`]);
+  if (check.status !== 0 || check.stdout.trim() !== String(DATABASES.length)) {
+    fail(`${KEYS.join(" and ")} were written to .env, but the new account could not sign in over TCP at ${ACCOUNT.host}:${opts.port} or see its databases (a MySQL in a container sees another client address — this script is for a MySQL installed on this machine):\n${(check.stderr || check.stdout).trim()}`);
+  }
+  console.log(`✓ ${DATABASES.join(" and ")} ready for '${ACCOUNT.user}'@'${ACCOUNT.host}'; ${KEYS.join(" and ")} written to .env`);
+  const unfilled = env.unfilled.filter((k) => !KEYS.includes(k));
+  if (unfilled.length) console.log(`! no local value known for ${unfilled.join(", ")} — set them in .env`);
 }
-
-if (opts.printSql) {
-  const auth = authFor(opts.serverVersion);
-  console.log(`-- ${DATABASES.join(" + ")} and '${ACCOUNT.user}'@'${ACCOUNT.host}' on server ${opts.serverVersion} (${auth.plugin}).`);
-  console.log("-- Nothing was run. <password> is random (36 characters: letters, digits, \"-\"), written only to .env.");
-  process.stdout.write(setupSql(auth, "<password>"));
-  console.log(`-- .env:\n${KEYS.map((k, i) => `-- ${k}=${dsnFor(DATABASES[i], "<password>", opts.port)}`).join("\n")}`);
-  process.exit(0);
-}
-
-checkEnvFile(opts.replace);
-const client = findClient(opts.mysql);
-const adminPassword = await askHidden(`MySQL password for ${opts.adminUser}@${opts.host}:${opts.port} (not shown, not saved): `);
-const admin = { user: opts.adminUser, password: adminPassword, host: opts.host, port: opts.port };
-
-const probe = mysql(client, admin, ["-N", "-B", "-e", "SELECT VERSION()"]);
-if (probe.status !== 0) fail(`could not sign in as ${opts.adminUser}:\n${probe.stderr.trim()}`);
-const version = probe.stdout.trim();
-const auth = authFor(version);
-console.log(`MySQL server ${version} → account plugin: ${auth.plugin}`);
-
-const password = newPassword();
-const setup = mysql(client, admin, [], setupSql(auth, password));
-if (setup.status !== 0) fail(`the setup SQL failed — nothing was written to .env:\n${setup.stderr.trim()}`);
-// The account now has this password: .env gets it before anything else can fail.
-writeEnv(Object.fromEntries(KEYS.map((k, i) => [k, dsnFor(DATABASES[i], password, opts.port)])));
-
-// Sign in as the new account, over TCP like the app does, and see both databases.
-const app = { user: ACCOUNT.user, password, host: ACCOUNT.host, port: opts.port };
-const check = mysql(client, app, ["--protocol=TCP", "-N", "-B", "-e",
-  `SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME IN (${DATABASES.map((d) => `'${d}'`).join(", ")})`]);
-if (check.status !== 0 || check.stdout.trim() !== String(DATABASES.length)) {
-  fail(`${KEYS.join(" and ")} were written to .env, but the new account could not sign in over TCP at ${ACCOUNT.host}:${opts.port} or see its databases (a MySQL in a container sees another client address — this script is for a MySQL installed on this machine):\n${(check.stderr || check.stdout).trim()}`);
-}
-console.log(`✓ ${DATABASES.join(" and ")} ready for '${ACCOUNT.user}'@'${ACCOUNT.host}'; ${KEYS.join(" and ")} written to .env`);

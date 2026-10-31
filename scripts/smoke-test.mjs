@@ -345,9 +345,9 @@ async function testStack(stack) {
     }
     pass("scaffold");
 
-    copyFileSync(join(dir, ".env.example"), join(dir, ".env"));
-    // .env.example leaves DB_DSN empty (scripts/db-local.mjs fills it on a developer's machine)
-    // and the Go API refuses to start without one. Without SMOKE_DB_DSN, point it at a port
+    // The scaffold wrote .env with local values (scripts/env-local.mjs) — the run uses it as a
+    // developer would. DB_DSN stays empty there (scripts/db-local.mjs fills it on a developer's
+    // machine) and the Go API refuses to start without one. Without SMOKE_DB_DSN, point it at a port
     // nothing listens on: the API runs, /readyz answers 503, and no MySQL on this machine is
     // ever contacted.
     if (stack === "go") setEnvVar(dir, "DB_DSN", process.env.SMOKE_DB_DSN || UNREACHABLE_DSN);

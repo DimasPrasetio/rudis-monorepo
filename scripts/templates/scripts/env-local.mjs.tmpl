@@ -1,0 +1,135 @@
+#!/usr/bin/env node
+// Fills .env (gitignored) with LOCAL values that work, from .env.example — so the app runs on a
+// developer's machine without anyone editing .env:
+//
+//   node scripts/env-local.mjs        creates .env, or adds what .env.example gained since (a
+//                                     module installed with module.mjs adds its keys there)
+//
+// A value already in .env is never changed. An empty or placeholder value gets:
+//   *_SECRET (not *_CLIENT_SECRET)    a random 64-character hex value
+//   *BOOTSTRAP*EMAIL / *PASSWORD / *NAME   the local sign-in: admin@gmail.com / admin123 / admin
+//   anything else                     the value .env.example gives (empty = the module's default)
+// __KEY_MAIN__ and __KEY_TEST__ stay empty here: node scripts/db-local.mjs fills them.
+//
+// These values are for this machine only. The server's .env is written by hand from
+// infra/deploy/.env.production.example, and deploy.sh refuses one that holds the local sign-in.
+import { randomBytes } from "node:crypto";
+import { chmodSync, existsSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+/** The local sign-in, the same in every project. Never used outside a developer's machine. */
+export const LOCAL_SIGN_IN = { email: "admin@gmail.com", password: "admin123", name: "admin" };
+const DB_KEYS = ["__KEY_MAIN__", "__KEY_TEST__"];
+// A value nobody can run with: an empty marker left for a person to fill.
+const PLACEHOLDER = /^(change-?me\b.*|__[A-Z0-9_]+__|<[^<>]*>)$/i;
+const ENTRY = /^[ \t]*(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)[ \t]*=(.*)$/;
+
+/** The value as dotenv reads it: a quoted value without its quotes, else without a " # comment". */
+function unquote(raw) {
+  const v = raw.trim();
+  const quoted = v.match(/^(["'])(.*?)\1/);
+  return quoted ? quoted[2] : v.replace(/\s+#.*$/, "").trim();
+}
+
+/** The local value for a key whose value is empty or a placeholder; undefined: keep the example's. */
+function localValue(key) {
+  if (DB_KEYS.includes(key)) return undefined;
+  // A secret this app signs with is random; one another service issues (*_CLIENT_SECRET) is
+  // not, so it stays for a person to set.
+  if (/(^|_)SECRET$/.test(key) && !/CLIENT_SECRET$/.test(key)) return randomBytes(32).toString("hex");
+  if (/BOOTSTRAP/.test(key)) {
+    if (/EMAIL$/.test(key)) return LOCAL_SIGN_IN.email;
+    if (/PASSWORD$/.test(key)) return LOCAL_SIGN_IN.password;
+    if (/NAME$/.test(key)) return LOCAL_SIGN_IN.name;
+  }
+  return undefined;
+}
+
+/**
+ * Creates or completes <root>/.env from <root>/.env.example. Returns what it did; `unfilled`
+ * lists keys still holding a placeholder (nothing here knows a working local value for them).
+ */
+export function fillLocalEnv(root) {
+  const exampleFile = join(root, ".env.example");
+  const envFile = join(root, ".env");
+  const example = readFileSync(exampleFile, "utf8").split(/\r?\n/);
+  const created = !existsSync(envFile);
+  let text = created ? "" : readFileSync(envFile, "utf8");
+  const eol = text.includes("\r\n") ? "\r\n" : "\n";
+  const lines = text === "" ? [] : text.split(/\r?\n/);
+  if (lines.length && lines.at(-1) === "") lines.pop();
+  const index = new Map();
+  // The first line of a key, as db-local.mjs reads and writes it.
+  lines.forEach((l, i) => { const m = l.match(ENTRY); if (m && !index.has(m[1])) index.set(m[1], i); });
+
+  const filled = [];
+  const added = [];
+  const value = (key, exampleValue) => {
+    const local = localValue(key);
+    if (local !== undefined && (exampleValue === "" || PLACEHOLDER.test(exampleValue))) {
+      filled.push(key);
+      return local;
+    }
+    return exampleValue;
+  };
+
+  let comments = [];
+  for (const line of example) {
+    const m = line.match(ENTRY);
+    if (!m) {
+      comments = line.trim().startsWith("#") ? [...comments, line] : [];
+      if (created) lines.push(line);
+      continue;
+    }
+    const [, key, raw] = m;
+    const exampleValue = unquote(raw);
+    if (index.has(key)) {
+      // Present: only an empty or placeholder value is replaced, never one somebody set.
+      const i = index.get(key);
+      const current = unquote(lines[i].match(ENTRY)[2]);
+      if (current === "" || PLACEHOLDER.test(current)) {
+        const local = localValue(key);
+        const next = local
+          ?? (PLACEHOLDER.test(current) && exampleValue !== "" && !PLACEHOLDER.test(exampleValue) ? exampleValue : current);
+        if (next !== current) {
+          lines[i] = `${key}=${next}`;
+          if (local !== undefined) filled.push(key);
+        }
+      }
+    } else {
+      if (!created) {
+        if (!added.length) lines.push("", "# Added from .env.example by node scripts/env-local.mjs");
+        lines.push(...comments);
+        added.push(key);
+      }
+      index.set(key, lines.length);
+      lines.push(`${key}=${value(key, exampleValue)}`);
+    }
+    comments = [];
+  }
+  while (lines.length && lines.at(-1) === "") lines.pop();
+  writeFileSync(envFile, lines.join(eol) + eol);
+  try { chmodSync(envFile, 0o600); } catch {}
+
+  const unfilled = [...index.keys()].filter((k) => {
+    const m = lines[index.get(k)].match(ENTRY);
+    return m && PLACEHOLDER.test(unquote(m[2]));
+  });
+  const dbEmpty = DB_KEYS.filter((k) => index.has(k) && unquote(lines[index.get(k)].match(ENTRY)[2]) === "");
+  return { created, filled, added, unfilled, dbEmpty };
+}
+
+// Real paths on both sides: run through a symlink or junction, argv[1] is not the file's path.
+if (process.argv[1] && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))) {
+  const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+  const r = fillLocalEnv(root);
+  console.log(`env-local: .env ${r.created ? "created" : "updated"}` +
+    (r.added.length ? ` · added ${r.added.join(", ")}` : "") +
+    (r.filled.length ? ` · local values for ${r.filled.join(", ")}` : ""));
+  if (r.dbEmpty.length) console.log(`env-local: ${r.dbEmpty.join(" and ")} still empty — node scripts/db-local.mjs fills them`);
+  if (r.unfilled.length) {
+    console.error(`env-local: no local value known for ${r.unfilled.join(", ")} — set them in .env`);
+    process.exit(1);
+  }
+}

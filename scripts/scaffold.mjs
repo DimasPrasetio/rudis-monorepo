@@ -17,6 +17,7 @@
 import { mkdirSync, writeFileSync, existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
+import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 // Files that are code rather than per-project text (the Go kernel, the shadcn primitives)
@@ -273,9 +274,10 @@ infra/deploy
 
 const dbName = `${slug}_db`;
 
-// Local databases: `node scripts/db-local.mjs`, run by the developer, creates <slug>_db and
-// <slug>_test with one account and fills these two keys in .env. They stay EMPTY here: a
-// placeholder shaped like a real DSN gets used against whatever MySQL listens on 3306.
+// Local databases: `node scripts/db-local.mjs` creates <slug>_db and <slug>_test with one
+// account and fills these two keys in .env. They stay EMPTY here: a placeholder shaped like a
+// real DSN gets used against whatever MySQL listens on 3306. Every other key gets a working
+// local value in .env from `node scripts/env-local.mjs`, which the scaffold runs once at the end.
 const testDbName = `${slug}_test`;
 const dbKeys = backend === "go" ? ["DB_DSN", "TEST_DB_DSN"] : ["DATABASE_URL", "TEST_DATABASE_URL"];
 const dbUrlLine = `# Filled by \`node scripts/db-local.mjs\` (creates ${dbName} + ${testDbName} on your MySQL).
@@ -287,6 +289,7 @@ template("scripts/db-local.mjs.tmpl", "scripts/db-local.mjs", {
   __SLUG__: slug, __DB_MAIN__: dbName, __DB_TEST__: testDbName,
   __KEY_MAIN__: dbKeys[0], __KEY_TEST__: dbKeys[1], __DSN_STYLE__: backend === "go" ? "go" : "url",
 });
+template("scripts/env-local.mjs.tmpl", "scripts/env-local.mjs", { __KEY_MAIN__: dbKeys[0], __KEY_TEST__: dbKeys[1] });
 
 file(".env.example", `APP_ENV=development
 APP_PORT=8080
@@ -294,7 +297,7 @@ APP_NAME=${name}
 ${backend === "go" ? "# Where business dates and calendar schedules are counted (IANA name).\nAPP_TIMEZONE=Asia/Jakarta\n" : ""}
 DB_HOST=localhost
 DB_PORT=3306
-DB_USER=root
+DB_USER=
 DB_PASSWORD=
 DB_NAME=${dbName}
 ${dbUrlLine}
@@ -320,7 +323,7 @@ services:
       dockerfile: infra/docker/Dockerfile
     ports:
       - "8080:8080"
-    # Copy .env.example to .env before running compose.
+    # .env holds local values (scripts/env-local.mjs + db-local.mjs write it).
     env_file:
       - .env
     extra_hosts:
@@ -333,10 +336,13 @@ Monorepo generated to the Rudis standard (modular-monolith backend + React 19 fr
 
 ## Development
 
-The API needs its databases first. Once, yourself, in a terminal: it asks your MySQL admin
-password (never stored), creates \`${dbName}\` and \`${testDbName}\` with one account that
-may use only those two, and writes \`${dbKeys[0]}\` and \`${dbKeys[1]}\` to \`.env\`
-(\`--print-sql\` shows the SQL without running it):
+\`.env\` (gitignored) already holds local values that work — a random \`JWT_SECRET\`, and the
+local sign-in \`admin@gmail.com\` / \`admin123\` once a module needs one; \`node scripts/env-local.mjs\`
+adds what \`.env.example\` gains later. The API needs its databases once: this creates
+\`${dbName}\` and \`${testDbName}\` with one account that may use only those two, and writes
+\`${dbKeys[0]}\` and \`${dbKeys[1]}\` to \`.env\`. It asks your MySQL admin password (hidden,
+never stored); with a root that has no password (Laragon, XAMPP) add \`--admin-password-empty\`
+and it asks nothing. \`--print-sql\` shows the SQL without running it.
 
 \`\`\`bash
 node scripts/db-local.mjs
@@ -853,6 +859,12 @@ Applies to: \`apps/api/**\`.
   local host and a name ending in \`_test\` — before it loads \`.env\`, and a variable set to ""
   is refused, never refilled from the file. Test its refusals on the guard function with no
   database (${backend === "go" ? "\`npm run test:scripts\`" : "a unit test"}), never by running the destructive script with a bad value.
+- Local databases: \`node scripts/db-local.mjs --admin-password-empty\` (MySQL root with no
+  password, localhost only; this project's databases and account only). Exit 3 (root has a
+  password, or no MySQL answers) or 4 (the databases or account already exist): it changed
+  nothing — the user runs \`node scripts/db-local.mjs\` in their own terminal; never ask for the
+  password. Exit 1: read the message. After \`module.mjs add\`, \`node scripts/env-local.mjs\`
+  gives new keys local values.
 ${backend === "go" ? "- Go: golang-migrate for migrations (timestamp-versioned; CI refuses one older than the newest\n  on main — \`node scripts/check-migrations.mjs <base> --fix\` renames it; \"not applicable\"\n  while the base has no migrations yet, e.g. the first commit), sqlc for access (one\n  generated package per module), database/sql + MySQL driver. Not GORM.\n" : ""}${backend === "nestjs" ? "- NestJS: Prisma migrations (not TypeORM unless explicitly requested).\n" : ""}${backend === "express" ? "- Express: migration tool is not locked — confirm the choice before implementing migrations.\n" : ""}`);
 file(".claude/rules/deployment.md", `# Rule: Deployment (deploy server)
 
@@ -1210,6 +1222,12 @@ fi
 perm="$(stat -c %a .env 2>/dev/null || stat -f %Lp .env)"
 [ "$perm" = "600" ] || { echo "  ✗ .env must be chmod 600 (is $perm)"; exit 1; }
 [ "$(envval APP_ENV)" = "production" ] || { echo "  ✗ APP_ENV in .env must be production"; exit 1; }
+# The local sign-in scripts/env-local.mjs writes on a developer's machine never runs here — in
+# any form docker compose still reads (quotes, export, spaces, a trailing comment, any case).
+local_signin='^[[:space:]]*(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*[[:space:]]*=[[:space:]]*["'"'"']?(admin@gmail[.]com|admin123)["'"'"']?([[:space:]]+#.*)?[[:space:]]*$'
+if grep -qiE "$local_signin" .env; then
+  echo "  ✗ .env holds the local sign-in (admin@gmail.com / admin123) — give this server its own values"; exit 1
+fi
 DB_NAME="$(envval DB_NAME)"
 [ -n "$DB_NAME" ] || { echo "  ✗ DB_NAME is empty in .env"; exit 1; }
 [ "$DB_NAME" = "\${APP}_db" ] || echo "  ! DB_NAME is $DB_NAME, convention is \${APP}_db"
@@ -2755,6 +2773,12 @@ for (const dir of keepDirs) {
   writeFileSync(abs, "");
   written++;
 }
+// .env with local values that work (gitignored); an existing one keeps every value it has.
+const envLocal = spawnSync(process.execPath, ["scripts/env-local.mjs"], { cwd: targetDir, encoding: "utf8" });
+if (envLocal.status !== 0 || !existsSync(join(targetDir, ".env"))) {
+  console.error(`✗ scripts/env-local.mjs did not write .env:\n${envLocal.stderr || envLocal.stdout}`);
+  process.exit(1);
+}
 
 process.stdout.write(
   `\n✓ Scaffolded "${name}" (${backend}) into ${targetDir}\n` +
@@ -2762,7 +2786,8 @@ process.stdout.write(
   `Next steps:\n` +
   `  1. Read the matching reference(s) in the skill and fill in modules + knowledge/.\n` +
   `  2. npm install\n` +
-  `  3. The user runs  node scripts/db-local.mjs  in their own terminal (local MySQL databases + .env).\n` +
+  `  3. node scripts/db-local.mjs --admin-password-empty   (local MySQL databases into .env; exit 3 or 4\n` +
+  `     = nothing changed: the user runs  node scripts/db-local.mjs  in their own terminal)\n` +
   `  4. npm run dev:web   /   npm run dev:api\n` +
   (backend === "go" ? `  5. cd apps/api && go mod tidy   (commit go.sum — the image build needs it)\n` : "") +
   `\nDeploy target: ${targetLabel} as "${slug}" — facts in knowledge/DEPLOYMENT.md.\n` +

@@ -70,7 +70,7 @@ The standard is intentionally anti-overengineering: a modular monolith with clea
 
    Run `node scripts/scaffold.mjs --help` for options. After scaffolding, read the relevant reference file(s) below and fill in project-specific code, modules, and `knowledge/` content.
 
-   The local databases come from `node scripts/db-local.mjs`, which **the user runs in their own terminal** — it asks their MySQL admin password itself, so never ask for it, never run it for them, and never fill a DSN into `.env` or `.env.example` yourself. Until then, nothing in the project touches MySQL. A script that drops or rebuilds a database checks its target with `scripts/db-guard.mjs` first, and its refusals are tested on the guard, never by running it with a bad value — [references/local-database.md](references/local-database.md).
+   The scaffold writes `.env` (gitignored) with local values that work — a random `JWT_SECRET`, and once a module needs one the local sign-in `admin@gmail.com` / `admin123` (name `admin`); after each `module.mjs add`, run `node scripts/env-local.mjs` to give the new keys local values. Then prepare the local databases yourself with `node scripts/db-local.mjs --admin-password-empty`: it signs in to this machine's MySQL as root with no password (the Laragon / XAMPP default), creates only this project's `<slug>_db`, `<slug>_test` and `<slug>_dev`, and fills the DB keys in `.env`. If it exits 3 (root has a password, or no MySQL answers) or 4 (those databases or the account already exist — it never reuses them unattended), stop and give the user the one command it prints, `node scripts/db-local.mjs`, to run in their own terminal — never ask for the password, never pass one on a command line or in a file, and never write a DSN into `.env` or `.env.example` by hand. These values are local only: the server's `.env` comes from `.env.production.example`, and `deploy.sh` refuses the local sign-in. A script that drops or rebuilds a database checks its target with `scripts/db-guard.mjs` first, and its refusals are tested on the guard, never by running it with a bad value — [references/local-database.md](references/local-database.md).
 2. **Before building any UI, research the design** — follow [references/design-research.md](references/design-research.md): pin down the app type, users, primary device, and locale; research current sources on the internet (real products of that app type, a fitting design system, UX research); write the brief into `knowledge/DESIGN.md`; then build the screens through `frontend-design` from that brief. Never start UI from a generic template or from memory alone. Not needed when only restyling or fixing a screen the brief already covers. The brief also decides whether a theme preset from the module library is the starting point.
 3. **Assemble from the module library before writing features** (Go backend) — follow [references/module-library.md](references/module-library.md): read the library's `CATALOG.md`, split the requirement into capabilities, decide per capability *install / install + adapt / build*, confirm that table with the user once, install with `module.mjs` (preset → ui kits → providers → consumers, ports wired), then build only what is custom — to the same standard, so it could join the library later. Applies to a new project and to every new feature.
 4. **For auditing/restructuring an existing repo**, skip the script and check the repo against the [Final Checklist](#final-checklist) plus the relevant references.
@@ -91,7 +91,7 @@ The body below is the always-loaded summary. Detailed, stack-specific rules live
 | Design research before UI: what to research, source quality, the `knowledge/DESIGN.md` brief | [references/design-research.md](references/design-research.md) |
 | Module library: find, install, wire, upgrade, and promote reusable modules (`module.mjs`, `modules.lock.json`) | [references/module-library.md](references/module-library.md) |
 | API conventions + env standard | [references/api-standard.md](references/api-standard.md) |
-| Local databases (`db-local.mjs`), the MySQL account plugin and Error 1524, guarding scripts that rebuild a database, `check-migrations` | [references/local-database.md](references/local-database.md) |
+| Local `.env` values (`env-local.mjs`, the local sign-in) and databases (`db-local.mjs`), the MySQL account plugin and Error 1524, guarding scripts that rebuild a database, `check-migrations` | [references/local-database.md](references/local-database.md) |
 | Deployment: Docker image, CI → GHCR, deploy server (compose, deploy.sh, nginx, MySQL) | [references/docker-deployment.md](references/docker-deployment.md) |
 
 ## High-Level Monorepo Structure
@@ -121,7 +121,7 @@ project-name/
 │   └── nginx/                # host nginx site template
 ├── .github/workflows/        # ci.yml + release-image.yml (build → GHCR)
 ├── scripts/
-├── .env.example              # never a real .env with secrets
+├── .env.example              # every key, no secret; .env (gitignored) holds local values only
 ├── .dockerignore
 ├── .gitignore
 ├── docker-compose.yml        # local build check only — production is image-only
@@ -213,7 +213,7 @@ Before delivering the structure or changing code, verify:
 - Prod compose image-only with required `IMAGE_TAG`, `127.0.0.1:<port>:8080`, no DB service? CI builds the image; nothing builds on the server?
 - Image non-root with `ENTRYPOINT` and a `/readyz` HEALTHCHECK? `deploy.sh` backs up the DB before migrating?
 - `.claude/rules/deployment.md` and `knowledge/DEPLOYMENT.md` present, with no secret committed anywhere?
-- `.env.example` present, with no real secrets?
+- `.env.example` present, with no real secrets? `.env` gitignored, holding local values only, with no placeholder left?
 - `knowledge/` matches the new file list, with no parallel `docs/` rack (only the RUDIS SDD output folders `.claude/rules/monorepo.md` lists)?
 - RUDIS SDD in use: each `specs/<NNN>-<slug>/` named in its `analysis.md`, its contracts and tables moved to their owners with a `FROZEN.md` before handover, and the folder frozen once merged into main?
 - `knowledge/SOURCE_PRIORITY.md` present?

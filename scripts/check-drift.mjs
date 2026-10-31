@@ -369,6 +369,9 @@ for (const backend of ["go", "nestjs", "express"]) {
     const syntax = spawnSync("bash", ["-n", join(dir, "infra/deploy/deploy.sh")], { encoding: "utf8" });
     need(syntax.status === 0, `deploy.sh has a bash syntax error: ${syntax.stderr}`);
     for (const step of ["mysqldump", "pull app", "up -d app", "/readyz", "IMAGE_TAG"]) need(deploy.includes(step), `deploy.sh lost step: ${step}`);
+    // The local sign-in (scripts/env-local.mjs) stays on developers' machines.
+    need(deploy.includes("admin@gmail[.]com|admin123"), "deploy.sh must refuse a .env holding the local sign-in");
+    need(!/admin@gmail|admin123/.test(read("infra/deploy/.env.production.example")), ".env.production.example must not hold the local sign-in");
     need(!/__[A-Z_]+__/.test(deploy) && !/__[A-Z_]+__/.test(prod), "placeholder left although every deploy flag was passed");
 
     const nginx = read("infra/nginx/nginx.conf");

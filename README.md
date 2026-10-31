@@ -98,7 +98,7 @@ rudis-monorepo/
 │   ├── frontend.md
 │   ├── design-research.md         # research how this app type is ideally designed, before any UI
 │   ├── api-standard.md
-│   ├── local-database.md          # db-local.mjs, MySQL account plugin, guarding DB-rebuilding scripts
+│   ├── local-database.md          # local .env (env-local.mjs), db-local.mjs, MySQL account plugin, guarding DB-rebuilding scripts
 │   └── docker-deployment.md       # deploy standard for the deploy server
 ├── scripts/
 │   ├── scaffold.mjs               # zero-dependency Node scaffolder
