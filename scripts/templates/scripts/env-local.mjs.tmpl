@@ -10,6 +10,8 @@
 //   *BOOTSTRAP*EMAIL / *PASSWORD / *NAME   the local sign-in: admin@gmail.com / admin123 / admin
 //   anything else                     the value .env.example gives (empty = the module's default)
 // __KEY_MAIN__ and __KEY_TEST__ stay empty here: node scripts/db-local.mjs fills them.
+// The database keys db-local.mjs writes are emptied when a placeholder is anywhere in them
+// (__ISI_USER__:__ISI_SANDI__@tcp(…)/app_db), so db-local.mjs can write them.
 //
 // These values are for this machine only. The server's .env is written by hand from
 // infra/deploy/.env.production.example, and deploy.sh refuses one that holds the local sign-in.
@@ -23,6 +25,15 @@ export const LOCAL_SIGN_IN = { email: "admin@gmail.com", password: "admin123", n
 const DB_KEYS = ["__KEY_MAIN__", "__KEY_TEST__"];
 // A value nobody can run with: an empty marker left for a person to fill.
 const PLACEHOLDER = /^(change-?me\b.*|__[A-Z0-9_]+__|<[^<>]*>)$/i;
+// What db-local.mjs writes. A placeholder inside one of these (a DSN built from them) leaves no
+// connection to keep — db-local.mjs's own passwords never hold one.
+const DB_CONNECTION_KEYS = [...DB_KEYS, "DB_HOST", "DB_PORT", "DB_USER", "DB_PASSWORD", "DB_NAME"];
+const PLACEHOLDER_INSIDE = /\bchange-?me\b|__[A-Z0-9_]+__|<[^<>]*>/i;
+
+/** Whether `value` of `key` is a marker left for a person to fill, not something that runs. */
+export function holdsPlaceholder(key, value) {
+  return PLACEHOLDER.test(value) || (DB_CONNECTION_KEYS.includes(key) && PLACEHOLDER_INSIDE.test(value));
+}
 const ENTRY = /^[ \t]*(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)[ \t]*=(.*)$/;
 
 /** The value as dotenv reads it: a quoted value without its quotes, else without a " # comment". */
@@ -67,11 +78,11 @@ export function fillLocalEnv(root) {
   const added = [];
   const value = (key, exampleValue) => {
     const local = localValue(key);
-    if (local !== undefined && (exampleValue === "" || PLACEHOLDER.test(exampleValue))) {
+    if (local !== undefined && (exampleValue === "" || holdsPlaceholder(key, exampleValue))) {
       filled.push(key);
       return local;
     }
-    return exampleValue;
+    return DB_CONNECTION_KEYS.includes(key) && holdsPlaceholder(key, exampleValue) ? "" : exampleValue;
   };
 
   let comments = [];
@@ -88,10 +99,12 @@ export function fillLocalEnv(root) {
       // Present: only an empty or placeholder value is replaced, never one somebody set.
       const i = index.get(key);
       const current = unquote(lines[i].match(ENTRY)[2]);
-      if (current === "" || PLACEHOLDER.test(current)) {
+      if (current === "" || holdsPlaceholder(key, current)) {
         const local = localValue(key);
-        const next = local
-          ?? (PLACEHOLDER.test(current) && exampleValue !== "" && !PLACEHOLDER.test(exampleValue) ? exampleValue : current);
+        const fromExample = exampleValue !== "" && !holdsPlaceholder(key, exampleValue) ? exampleValue : undefined;
+        // A database key with a placeholder: the example's value, else empty for db-local.mjs.
+        const next = local ?? (!holdsPlaceholder(key, current) ? current
+          : fromExample ?? (DB_CONNECTION_KEYS.includes(key) ? "" : current));
         if (next !== current) {
           lines[i] = `${key}=${next}`;
           if (local !== undefined) filled.push(key);
@@ -114,7 +127,7 @@ export function fillLocalEnv(root) {
 
   const unfilled = [...index.keys()].filter((k) => {
     const m = lines[index.get(k)].match(ENTRY);
-    return m && PLACEHOLDER.test(unquote(m[2]));
+    return m && holdsPlaceholder(k, unquote(m[2]));
   });
   const dbEmpty = DB_KEYS.filter((k) => index.has(k) && unquote(lines[index.get(k)].match(ENTRY)[2]) === "");
   return { created, filled, added, unfilled, dbEmpty };

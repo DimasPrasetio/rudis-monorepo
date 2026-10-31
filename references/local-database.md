@@ -18,7 +18,7 @@ It never changes a value already set; an empty or placeholder one (`change-me`, 
 | `*BOOTSTRAP*EMAIL` (`USERS_BOOTSTRAP_EMAIL`, `RBAC_BOOTSTRAP_ADMIN_EMAIL`) | `admin@gmail.com` |
 | `*BOOTSTRAP*PASSWORD` | `admin123` |
 | `*BOOTSTRAP*NAME` | `admin` |
-| the database keys | left to `db-local.mjs` (below) |
+| the database keys | left to `db-local.mjs` (below); one with a placeholder anywhere in it (`__ISI_USER__:__ISI_SANDI__@tcp(…)/app_db`, `DB_USER=__ISI_USER__`) is emptied, and `db-local.mjs` does not count it as another account |
 | anything else | the value `.env.example` gives — empty means the module's default |
 
 A placeholder it has no value for is named, and it exits 1. The users module signs in by

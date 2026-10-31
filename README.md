@@ -106,7 +106,8 @@ rudis-monorepo/
 │   ├── module-contract.json       # fingerprints of the files library modules build on
 │   ├── smoke-test.mjs
 │   ├── generated-scripts.test.mjs # the database scripts a project gets, no MySQL needed
-│   ├── package.mjs
+│   ├── package.mjs                # builds and checks dist/*.skill — entries always `/`-separated
+│   ├── package.test.mjs           # its zip reader/writer and entry guard, no build
 │   └── server/                    # installed once per server: nightly rotated DB backups
 ├── evals/                         # dev/QA test cases (NOT shipped in the .skill)
 ├── dist/
@@ -134,7 +135,9 @@ and enforces one owner per fact across the generated knowledge base — see *One
 [references/knowledge-gateway.md](references/knowledge-gateway.md)), `scripts/smoke-test.mjs` (scaffolds all three stacks, `npm
 install`s them, type-checks, and boots `dev:api`/`dev:web` for real), then
 `scripts/package.mjs` (rebuilds `dist/rudis-monorepo.skill` from source and verifies the
-archive contains only the payload — no `evals/`, `dist/`, or `install.*`). No change
+archive contains only the payload — no `evals/`, `dist/`, or `install.*` — and that every entry
+uses `/`: on Windows it writes the zip itself, since Windows PowerShell's `ZipFile` writes `\`,
+which `unzip` warns about and exits 1). No change
 to `SKILL.md`, `references/`, or `scaffold.mjs` is done until `npm run verify` is green. Then
 re-run the installer on each device.
 

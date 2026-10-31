@@ -118,6 +118,48 @@ test("env-local: keys a module adds get local values; the local sign-in is admin
   assert.equal(envOf(crlf).USERS_BOOTSTRAP_EMAIL, "admin@gmail.com");
   assert.equal(envOf(crlf).USERS_BOOTSTRAP_PASSWORD, "admin123");
 
+  // The inventory .env's database keys: a placeholder anywhere in them empties them for
+  // db-local.mjs (exit 0); DB_HOST falls back to .env.example's value.
+  const inventory = (lines) => {
+    let text = once;
+    for (const [k, v] of Object.entries(lines)) text = text.replace(new RegExp(`^${k}=.*$`, "m"), `${k}=${v}`);
+    writeFileSync(join(dir, ".env"), text.replace(/\n/g, "\r\n"));
+    const r = node(["scripts/env-local.mjs"], { cwd: dir });
+    return { r, env: envOf(readFileSync(join(dir, ".env"), "utf8")) };
+  };
+  const inv = inventory({
+    DB_DSN: "__ISI_USER_MYSQL__:__ISI_SANDI_MYSQL__@tcp(127.0.0.1:3306)/kasirapp_db?parseTime=true",
+    TEST_DB_DSN: '"__ISI_USER_MYSQL__:__ISI_SANDI_MYSQL__@tcp(127.0.0.1:3306)/kasirapp_test" # isi',
+    DB_HOST: "__ISI_HOST_MYSQL__", DB_USER: "__ISI_USER_MYSQL__", DB_PASSWORD: "__ISI_SANDI_MYSQL__",
+    APP_NAME: "Toko __ISI__ Maju",
+  });
+  assert.equal(inv.r.status, 0, inv.r.stderr);
+  for (const k of ["DB_DSN", "TEST_DB_DSN", "DB_USER", "DB_PASSWORD"]) assert.equal(inv.env[k], "", k);
+  assert.equal(inv.env.DB_HOST, "localhost");
+  assert.equal(inv.env.APP_NAME, "Toko __ISI__ Maju", "outside the database keys only a whole-value placeholder counts");
+  assert.match(inv.r.stdout, /DB_DSN and TEST_DB_DSN still empty/);
+  // db-local.mjs then goes ahead: past its "another account" check, to the sign-in (exit 3 here).
+  const dbRun = node(["scripts/db-local.mjs", "--admin-password-empty", "--mysql", process.execPath], { cwd: dir });
+  assert.equal(dbRun.status, 3, dbRun.stderr);
+  // Run first, on the inventory .env as it is: a placeholder DSN is not another account either.
+  writeFileSync(join(dir, ".env"), once.replace(/^DB_DSN=.*$/m, "DB_DSN=__ISI_USER_MYSQL__:__ISI_SANDI_MYSQL__@tcp(127.0.0.1:3306)/kasirapp_db"));
+  const first = node(["scripts/db-local.mjs", "--admin-password-empty", "--mysql", process.execPath], { cwd: dir });
+  assert.equal(first.status, 3, first.stderr);
+  assert.doesNotMatch(first.stderr, /another account/);
+  // A DSN for some other real account still stops it.
+  writeFileSync(join(dir, ".env"), once.replace(/^DB_DSN=.*$/m, "DB_DSN=root:secret@tcp(127.0.0.1:3306)/kasirapp_db"));
+  const foreign = node(["scripts/db-local.mjs", "--admin-password-empty", "--mysql", process.execPath], { cwd: dir });
+  assert.equal(foreign.status, 1);
+  assert.match(foreign.stderr, /DB_DSN in \.env already point at another account/);
+  // Real values are never touched — a working DSN, user and password stay as they are.
+  const real = {
+    DB_DSN: "kasirapp_dev:Ab3-x9Kq@tcp(127.0.0.1:3306)/kasirapp_db", TEST_DB_DSN: "kasirapp_dev:Ab3-x9Kq@tcp(127.0.0.1:3306)/kasirapp_test",
+    DB_USER: "kasirapp_dev", DB_PASSWORD: "Ab3-x9Kq", DB_HOST: "127.0.0.1",
+  };
+  const kept = inventory(real);
+  assert.equal(kept.r.status, 0, kept.r.stderr);
+  for (const [k, v] of Object.entries(real)) assert.equal(kept.env[k], v, k);
+
   // A quoted placeholder with a trailing comment is still a placeholder; of two lines for one
   // key the first counts (as db-local.mjs reads it).
   writeFileSync(join(dir, ".env"), once

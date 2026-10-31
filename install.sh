@@ -16,8 +16,19 @@ fi
 mkdir -p "$DEST"
 rm -rf "$TARGET"
 
+case "$(uname -s)" in MINGW* | MSYS* | CYGWIN*) windows=1 ;; *) windows=0 ;; esac
+
 if command -v unzip >/dev/null 2>&1; then
   unzip -q "$SKILL" -d "$DEST"
+elif [ "$windows" = 1 ]; then
+  # Git Bash on Windows without unzip: .NET, as install.ps1 does. Never python3 here — on
+  # Windows it is often the WindowsApps alias, which opens the Store and hangs.
+  if ! command -v powershell >/dev/null 2>&1; then
+    echo "Need 'unzip' or PowerShell to extract the package — or run ./install.ps1 from PowerShell." >&2
+    exit 1
+  fi
+  SKILL="$(cygpath -w "$SKILL")" DEST="$(cygpath -w "$DEST")" powershell -NoProfile -Command \
+    'Add-Type -AssemblyName System.IO.Compression.FileSystem; [System.IO.Compression.ZipFile]::ExtractToDirectory($env:SKILL, $env:DEST)'
 elif command -v python3 >/dev/null 2>&1; then
   python3 -c "import zipfile; zipfile.ZipFile('$SKILL').extractall('$DEST')"
 else
