@@ -32,7 +32,7 @@ import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, realpath
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { fillLocalEnv } from "./env-local.mjs";
+import { fillLocalEnv, holdsPlaceholder } from "./env-local.mjs";
 
 const APP = "__SLUG__";
 const DATABASES = ["__DB_MAIN__", "__DB_TEST__"];
@@ -150,7 +150,8 @@ function checkEnvFile(replace) {
   const ours = DSN_STYLE === "go" ? `${ACCOUNT.user}:` : `mysql://${ACCOUNT.user}:`;
   const foreign = KEYS.filter((k) => {
     const v = envValue(text, k);
-    return v && !v.startsWith(ours);
+    // A placeholder (__ISI_USER__:__ISI_SANDI__@tcp(…)) points at nobody: db-local writes over it.
+    return v && !v.startsWith(ours) && !holdsPlaceholder(k, v);
   });
   if (foreign.length) fail(`${foreign.join(" and ")} in .env already point at another account — rerun with --replace to overwrite.`);
 }
